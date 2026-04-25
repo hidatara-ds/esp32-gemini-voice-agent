@@ -43,7 +43,7 @@
 // Runtime
 #define RECORD_TIME 5
 #define SCROLL_SPEED_MS 80
-#define MESSAGE_DISPLAY_MS 30000
+#define MESSAGE_DISPLAY_MS 8000
 #define MAX_MSG_LENGTH 128
 #define DEBUG_SERIAL true
 
