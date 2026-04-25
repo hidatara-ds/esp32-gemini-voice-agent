@@ -677,11 +677,11 @@ int parseWavHeaderFromStream(WiFiClient* stream) {
 
 void playAudioFromUrl(String url) {
     if (txChan == nullptr || url.length() == 0) return;
-    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Downloading: %s\n", url.c_str());
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Playing from URL: %s\n", url.c_str());
 
-    // ── 1. Download seluruh WAV ke RAM dulu ──────────────────
     HTTPClient http;
     http.begin(url);
+    http.setTimeout(15000);
     int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK) {
         if (DEBUG_SERIAL) Serial.printf("[AUDIO] HTTP GET failed: %d\n", httpCode);
@@ -689,142 +689,174 @@ void playAudioFromUrl(String url) {
         return;
     }
 
-    int contentLen = http.getSize(); // bisa -1 jika chunked
+    // Baca Content-Length agar tahu ukuran file sebenarnya
+    int contentLength = http.getSize(); // -1 jika tidak diketahui
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Content-Length: %d\n", contentLength);
+
     WiFiClient* stream = http.getStreamPtr();
 
-    // Alokasi buffer — pakai PSRAM jika tersedia, fallback ke heap biasa
-    const size_t MAX_AUDIO_BYTES = 256 * 1024; // 256KB, cukup untuk ~8 detik TTS 16kHz
-    uint8_t* rawBuf = nullptr;
+    // ── Tentukan ukuran buffer ───────────────────────────────
+    // Prioritas: gunakan Content-Length jika tersedia.
+    // Fallback: 600KB via PSRAM, atau 180KB via heap biasa.
+    const size_t MAX_PSRAM_BYTES = 600 * 1024; // ~18 detik @ 16kHz mono 16-bit
+    const size_t MAX_HEAP_BYTES  = 180 * 1024; // ~5.5 detik, aman di heap biasa
 
-    #ifdef BOARD_HAS_PSRAM
-        rawBuf = (uint8_t*)ps_malloc(MAX_AUDIO_BYTES);
-        if (DEBUG_SERIAL) Serial.println("[AUDIO] Using PSRAM for audio buffer");
-    #endif
-
-    if (rawBuf == nullptr) {
-        rawBuf = (uint8_t*)malloc(MAX_AUDIO_BYTES);
+    size_t allocSize = 0;
+    if (contentLength > 0) {
+        allocSize = (size_t)contentLength;
+    } else if (psramFound()) {
+        allocSize = MAX_PSRAM_BYTES;
+    } else {
+        allocSize = MAX_HEAP_BYTES;
     }
 
-    if (rawBuf == nullptr) {
-        if (DEBUG_SERIAL) Serial.println("[AUDIO] ERROR: Tidak bisa alokasi buffer audio!");
+    uint8_t* rawBuf = nullptr;
+    if (psramFound()) {
+        rawBuf = (uint8_t*)ps_malloc(allocSize);
+        if (rawBuf && DEBUG_SERIAL) Serial.printf("[AUDIO] PSRAM alloc OK: %u bytes\n", (unsigned int)allocSize);
+    }
+    if (!rawBuf) {
+        // Heap fallback: batasi ke MAX_HEAP_BYTES agar tidak OOM
+        if (allocSize > MAX_HEAP_BYTES) allocSize = MAX_HEAP_BYTES;
+        rawBuf = (uint8_t*)malloc(allocSize);
+        if (rawBuf && DEBUG_SERIAL) Serial.printf("[AUDIO] Heap alloc: %u bytes\n", (unsigned int)allocSize);
+    }
+    if (!rawBuf) {
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] malloc gagal");
         http.end();
         return;
     }
 
-    // Download semua data
-    size_t totalDownloaded = 0;
-    unsigned long lastDataMs = millis();
+    // ── Download: baca sampai Content-Length terpenuhi atau stream habis ──
+    size_t total = 0;
+    uint8_t chunk[2048];
+    const unsigned long DOWNLOAD_TIMEOUT_MS = 20000;
+    unsigned long downloadStart = millis();
 
-    while ((http.connected() || stream->available()) && totalDownloaded < MAX_AUDIO_BYTES) {
-        size_t avail = stream->available();
-        if (avail == 0) {
-            if (millis() - lastDataMs > 3000) {
-                if (DEBUG_SERIAL) Serial.println("[AUDIO] Download timeout");
-                break;
-            }
-            delay(2);
-            continue;
+    while (total < allocSize) {
+        if (millis() - downloadStart > DOWNLOAD_TIMEOUT_MS) {
+            if (DEBUG_SERIAL) Serial.printf("[AUDIO] Download timeout setelah %u bytes\n", (unsigned int)total);
+            break;
         }
-        size_t want = avail;
-        if (want > MAX_AUDIO_BYTES - totalDownloaded) want = MAX_AUDIO_BYTES - totalDownloaded;
-        size_t got = stream->readBytes(rawBuf + totalDownloaded, want);
-        totalDownloaded += got;
-        lastDataMs = millis();
+
+        int waited = 0;
+        while (stream->available() == 0 && waited < 3000) {
+            if (!http.connected()) goto download_done;
+            delay(10);
+            waited += 10;
+        }
+        if (stream->available() == 0) break; // idle timeout
+
+        size_t want = stream->available();
+        if (want > sizeof(chunk)) want = sizeof(chunk);
+        if (want > allocSize - total) want = allocSize - total;
+
+        size_t got = stream->readBytes(chunk, want);
+        if (got > 0) {
+            memcpy(rawBuf + total, chunk, got);
+            total += got;
+        }
+
+        if (contentLength > 0 && total >= (size_t)contentLength) break;
     }
+    download_done:
     http.end();
 
-    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Downloaded %u bytes\n", (unsigned int)totalDownloaded);
-
-    if (totalDownloaded < 44) {
-        if (DEBUG_SERIAL) Serial.println("[AUDIO] Data terlalu kecil, bukan WAV valid");
+    // Validasi: jika Content-Length diketahui, pastikan download tidak terpotong
+    if (contentLength > 0 && total < (size_t)contentLength) {
+        if (DEBUG_SERIAL) Serial.printf("[AUDIO] WARN: download terpotong! got=%u expected=%d — skip playback\n",
+                                        (unsigned int)total, contentLength);
         free(rawBuf);
         return;
     }
 
-    // ── 2. Parse WAV header dari buffer ──────────────────────
-    // Cari offset "data" chunk
-    int dataOffset = -1;
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Downloaded: %u bytes\n", (unsigned int)total);
+
+    if (total < 44) {
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] File terlalu kecil");
+        free(rawBuf);
+        return;
+    }
+
+    // ── Parse WAV header: cari chunk "data" ─────────────────
     if (memcmp(rawBuf, "RIFF", 4) != 0 || memcmp(rawBuf + 8, "WAVE", 4) != 0) {
-        if (DEBUG_SERIAL) Serial.println("[AUDIO] Bukan file WAV valid");
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] Bukan WAV valid");
         free(rawBuf);
         return;
     }
 
+    int dataOffset = -1;
     int pos = 12;
-    while (pos + 8 <= (int)totalDownloaded) {
-        uint32_t chunkSize = rawBuf[pos+4] | (rawBuf[pos+5]<<8) | (rawBuf[pos+6]<<16) | (rawBuf[pos+7]<<24);
+    while (pos + 8 <= (int)total) {
+        uint32_t sz = rawBuf[pos+4] | (rawBuf[pos+5]<<8) | (rawBuf[pos+6]<<16) | (rawBuf[pos+7]<<24);
         if (memcmp(rawBuf + pos, "data", 4) == 0) {
             dataOffset = pos + 8;
             break;
         }
-        pos += 8 + chunkSize;
-        if (chunkSize & 1) pos++; // word align
+        pos += 8 + (int)sz + (sz & 1 ? 1 : 0);
     }
 
-    if (dataOffset < 0) {
+    if (dataOffset < 0 || dataOffset >= (int)total) {
         if (DEBUG_SERIAL) Serial.println("[AUDIO] WAV data chunk tidak ditemukan");
         free(rawBuf);
         return;
     }
 
-    uint8_t* pcmData  = rawBuf + dataOffset;
-    size_t   pcmBytes = totalDownloaded - dataOffset;
-    if (pcmBytes < 2) {
-        free(rawBuf);
-        return;
-    }
-    if (pcmBytes & 1) pcmBytes--; // pastikan genap
+    uint8_t* pcm   = rawBuf + dataOffset;
+    size_t   pcmLen = total - dataOffset;
+    if (pcmLen & 1) pcmLen--;
 
-    if (DEBUG_SERIAL) Serial.printf("[AUDIO] PCM offset=%d size=%u bytes (%.2fs)\n",
-        dataOffset, (unsigned int)pcmBytes, (float)pcmBytes / (16000.0f * 2.0f));
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] PCM: offset=%d len=%u (%.2fs)\n",
+        dataOffset, (unsigned int)pcmLen, pcmLen / (16000.0f * 2.0f));
 
-    // ── 3. Putar dari RAM ke I2S — tanpa network jitter ──────
-    const size_t STEREO_BUF_SIZE = 4096; // bytes stereo per chunk
-    uint8_t* stereoBuf = (uint8_t*)malloc(STEREO_BUF_SIZE);
-    if (!stereoBuf) {
-        if (DEBUG_SERIAL) Serial.println("[AUDIO] ERROR: Tidak bisa alokasi stereo buffer");
+    // ── Putar PCM ke I2S ─────────────────────────────────────
+    const size_t SBUF = 4096;
+    uint8_t* sbuf = (uint8_t*)malloc(SBUF);
+    if (!sbuf) {
         free(rawBuf);
         return;
     }
 
-    // Silence warm-up: isi DMA dengan nol sebelum mulai
-    memset(stereoBuf, 0, STEREO_BUF_SIZE);
+    // Silence warm-up
+    memset(sbuf, 0, SBUF);
     size_t dummy = 0;
-    i2s_channel_write(txChan, stereoBuf, STEREO_BUF_SIZE, &dummy, pdMS_TO_TICKS(200));
-    i2s_channel_write(txChan, stereoBuf, STEREO_BUF_SIZE, &dummy, pdMS_TO_TICKS(200));
+    i2s_channel_write(txChan, sbuf, SBUF, &dummy, pdMS_TO_TICKS(200));
 
-    // Putar chunk per chunk dari RAM
-    const size_t MONO_CHUNK = STEREO_BUF_SIZE / 2; // bytes mono per iterasi
-    size_t offset = 0;
-    uint32_t totalWritten = 0;
-
-    while (offset < pcmBytes) {
-        size_t chunkMono = pcmBytes - offset;
-        if (chunkMono > MONO_CHUNK) chunkMono = MONO_CHUNK;
-        if (chunkMono & 1) chunkMono--;
-
-        size_t stereoBytes = monoToStereoWithGain(pcmData + offset, chunkMono, stereoBuf, STEREO_BUF_SIZE);
+    size_t offset2 = 0;
+    while (offset2 < pcmLen) {
+        size_t monoChunk = pcmLen - offset2;
+        if (monoChunk > SBUF / 2) monoChunk = SBUF / 2;
+        if (monoChunk & 1) monoChunk--;
+        size_t stereoBytes = monoToStereoWithGain(pcm + offset2, monoChunk, sbuf, SBUF);
         if (stereoBytes > 0) {
             size_t written = 0;
-            i2s_channel_write(txChan, stereoBuf, stereoBytes, &written, pdMS_TO_TICKS(500));
-            totalWritten += written;
+            i2s_channel_write(txChan, sbuf, stereoBytes, &written, pdMS_TO_TICKS(500));
         }
-        offset += chunkMono;
+        offset2 += monoChunk;
     }
 
-    // Silence tail: flush DMA agar tidak ada pop di akhir
-    memset(stereoBuf, 0, STEREO_BUF_SIZE);
-    i2s_channel_write(txChan, stereoBuf, STEREO_BUF_SIZE, &dummy, pdMS_TO_TICKS(200));
-    i2s_channel_write(txChan, stereoBuf, STEREO_BUF_SIZE, &dummy, pdMS_TO_TICKS(200));
-    delay(80);
-
-    if (DEBUG_SERIAL) {
-        Serial.printf("[AUDIO] Playback selesai | pcm=%u | written=%u | vol=%d%% | gain=%d%%\n",
-            (unsigned int)pcmBytes, (unsigned int)totalWritten,
-            SPEAKER_VOLUME_PERCENT, SPEAKER_GAIN_PERCENT);
+    // Silence tail — isi semua DMA descriptor dengan silence
+    // dma_desc_num=8, dma_frame_num=512, stereo, 16-bit = 8 * 512 * 2 * 2 = 16384 bytes
+    // Kirim 2x lipat untuk memastikan semua descriptor terisi silence
+    const size_t SILENCE_FLUSH_BYTES = 32768;
+    uint8_t* silenceBuf = (uint8_t*)calloc(SILENCE_FLUSH_BYTES, 1);
+    if (silenceBuf) {
+        size_t dummy2 = 0;
+        i2s_channel_write(txChan, silenceBuf, SILENCE_FLUSH_BYTES, &dummy2, pdMS_TO_TICKS(500));
+        free(silenceBuf);
     }
+    delay(50);
 
-    free(stereoBuf);
+    // Reset DMA state sepenuhnya: disable lalu enable kembali
+    // Ini memastikan tidak ada data audio lama yang tersisa di ring buffer
+    i2s_channel_disable(txChan);
+    delay(10);
+    i2s_channel_enable(txChan);
+
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Selesai | vol=%d%% gain=%d%%\n",
+        SPEAKER_VOLUME_PERCENT, SPEAKER_GAIN_PERCENT);
+
+    free(sbuf);
     free(rawBuf);
 }
 
@@ -1267,16 +1299,59 @@ void loop() {
         }
         
         case STATE_DISPLAY: {
-            if (millis() - stateStartTime > MESSAGE_DISPLAY_MS) {
-                currentState = STATE_STANDBY;
+            // Cek timeout normal
+            bool displayTimeout = (millis() - stateStartTime > MESSAGE_DISPLAY_MS);
+
+            // VAD interrupt: jika pengguna mulai bicara sebelum timeout, langsung rekam
+            bool vadInterrupt = false;
+            if (!displayTimeout && rxChan != nullptr) {
+                int32_t vadBuf[64];
+                size_t vadBytes = 0;
+                if (i2s_channel_read(rxChan, vadBuf, sizeof(vadBuf), &vadBytes, 0) == ESP_OK && vadBytes > 0) {
+                    size_t vadSamples = vadBytes / sizeof(int32_t);
+                    long vadSum = 0;
+                    for (size_t i = 0; i < vadSamples; i++) {
+                        vadSum += abs(convertI2SSampleToPCM16(vadBuf[i]));
+                    }
+                    int vadEnergy = (int)(vadSum / (long)vadSamples);
+                    if (vadEnergy > VAD_THRESHOLD) {
+                        vadHitCount++;
+                        if (vadHitCount >= VAD_START_HITS) {
+                            vadInterrupt = true;
+                            if (DEBUG_SERIAL) Serial.printf("[VAD] Interrupt during DISPLAY (energy=%d)\n", vadEnergy);
+                        }
+                    } else if (vadHitCount > 0) {
+                        vadHitCount--;
+                    }
+                }
+            }
+
+            if (displayTimeout || vadInterrupt) {
+                currentState = vadInterrupt ? STATE_RECORDING : STATE_STANDBY;
                 currentMessage[0] = '\0';
-                
-                display.clearBuffer();
-                display.setFont(u8g2_font_6x10_tr);
-                display.drawStr(36, 36, "Standby");
-                display.sendBuffer();
-                
-                flushI2SInput(); // flush residual audio before standby
+                vadHitCount = 0;
+
+                if (vadInterrupt) {
+                    // Langsung mulai rekam
+                    audioDataSize = 0;
+                    recordStartMs = millis();
+                    lastRecordProgressLogMs = recordStartMs;
+                    recordPeakLevel = 0;
+                    silenceStartMs = 0;
+                    flushI2SInput();
+
+                    display.clearBuffer();
+                    display.setFont(u8g2_font_6x10_tr);
+                    display.drawStr(28, 36, "Listening...");
+                    display.sendBuffer();
+                } else {
+                    display.clearBuffer();
+                    display.setFont(u8g2_font_6x10_tr);
+                    display.drawStr(36, 36, "Standby");
+                    display.sendBuffer();
+
+                    flushI2SInput();
+                }
             }
             break;
         }
