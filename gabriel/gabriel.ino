@@ -49,6 +49,8 @@ const size_t RECORD_SIZE = I2S_SAMPLE_RATE * 2 * RECORD_TIME;
 uint8_t* audioBuffer = nullptr;
 size_t audioDataSize = 0;
 i2s_chan_handle_t rxChan = nullptr;
+i2s_chan_handle_t txChan = nullptr;
+String pendingAudioUrl = "";
 
 inline int16_t convertI2SSampleToPCM16(int32_t sample32) {
     int32_t s = sample32 >> I2S_SAMPLE_SHIFT;
@@ -566,6 +568,40 @@ void showError(const char* title, const char* detail) {
     display.sendBuffer();
 }
 
+void playAudioFromUrl(String url) {
+    if (txChan == nullptr || url.length() == 0) return;
+
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Playing: %s\n", url.c_str());
+
+    HTTPClient http;
+    http.begin(url);
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        WiFiClient* stream = http.getStreamPtr();
+        uint8_t buffer[1024];
+        
+        // Skip WAV header (44 bytes) to reach PCM data
+        int skipped = 0;
+        while (skipped < 44 && stream->connected()) {
+            int r = stream->read(buffer, 44 - skipped);
+            if (r > 0) skipped += r;
+        }
+
+        while (http.connected() && stream->available() > 0) {
+            size_t bytesRead = stream->readBytes(buffer, sizeof(buffer));
+            if (bytesRead > 0) {
+                size_t bytesWritten = 0;
+                i2s_channel_write(txChan, buffer, bytesRead, &bytesWritten, portMAX_DELAY);
+            }
+        }
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] Playback finished");
+    } else {
+        if (DEBUG_SERIAL) Serial.printf("[AUDIO] HTTP GET failed: %d\n", httpCode);
+    }
+    http.end();
+}
+
 // ═══════════════════════════════════════════════════════════
 // AUDIO UPLOAD
 // ═══════════════════════════════════════════════════════════
@@ -694,6 +730,13 @@ bool postAudio() {
         strncpy(currentCategory, "chat", sizeof(currentCategory) - 1);
         strncpy(currentEmoji, "AI", sizeof(currentEmoji) - 1);
 
+        const char* audioUrl = doc["audio_url"] | "";
+        if (strlen(audioUrl) > 0) {
+            pendingAudioUrl = String(API_BASE_URL) + audioUrl;
+        } else {
+            pendingAudioUrl = "";
+        }
+
         if (DEBUG_SERIAL) {
             const char* question = doc["question"] | "";
             Serial.printf("[API] OK 200 | question_len=%u | answer_len=%u\n",
@@ -789,6 +832,33 @@ void setup() {
         }
 
         flushI2SInput();
+    }
+
+    // Init I2S Speaker (MAX98357A) on I2S_NUM_1
+    i2s_chan_config_t txChanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    i2sErr = i2s_new_channel(&txChanCfg, &txChan, NULL);
+    if (i2sErr != ESP_OK) {
+        Serial.printf("[SPEAKER] i2s_new_channel failed: %d\n", i2sErr);
+    } else {
+        i2s_std_config_t txStdCfg = {
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = I2S_SPEAKER_BCLK,
+                .ws = I2S_SPEAKER_LRC,
+                .dout = I2S_SPEAKER_DIN,
+                .din = I2S_GPIO_UNUSED,
+                .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+            },
+        };
+        i2sErr = i2s_channel_init_std_mode(txChan, &txStdCfg);
+        if (i2sErr == ESP_OK) {
+            i2s_channel_enable(txChan);
+            Serial.println("[SPEAKER] OK: I2S TX initialized");
+        } else {
+            Serial.printf("[SPEAKER] i2s_channel_init_std_mode failed: %d\n", i2sErr);
+        }
     }
 
     if (DEBUG_SERIAL && MIC_DIAG_ON_BOOT) {
@@ -951,6 +1021,10 @@ void loop() {
             if (postAudio()) {
                 fetchCount++;
                 showMessageWithTypewriter();
+                if (pendingAudioUrl.length() > 0) {
+                    playAudioFromUrl(pendingAudioUrl);
+                    pendingAudioUrl = "";
+                }
             } else {
                 showError("Voice Failed!", currentMessage);
             }

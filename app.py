@@ -416,10 +416,14 @@ def api_process_audio():
         diagnostics['audio_delivery'] = audio_delivery
 
         if include_audio and audio_delivery in ("inline", "url"):
-            synthesize_speech(answer, "temp_response.mp3")
-            with open("temp_response.mp3", "rb") as audio_file:
+            encoding = texttospeech.AudioEncoding.LINEAR16 if is_esp_client else texttospeech.AudioEncoding.MP3
+            suffix = ".wav" if is_esp_client else ".mp3"
+            
+            temp_audio = f"temp_response_{uuid.uuid4().hex}{suffix}"
+            synthesize_speech(answer, temp_audio, encoding=encoding)
+            with open(temp_audio, "rb") as audio_file:
                 audio_bytes = audio_file.read()
-            os.remove("temp_response.mp3")
+            os.remove(temp_audio)
 
             if audio_delivery == "inline":
                 audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
@@ -437,7 +441,9 @@ def api_process_audio():
                     del AUDIO_CACHE[oldest_key]
                 response_payload['audio_id'] = audio_id
                 response_payload['audio_url'] = f"/api/audio/{audio_id}"
-                response_payload['audio_mime'] = "audio/mpeg"
+                # For ESP, we provide WAV (LINEAR16), for others MP3.
+                response_payload['audio_mime'] = "audio/wav" if is_esp_client else "audio/mpeg"
+                response_payload['audio_encoding'] = "LINEAR16" if is_esp_client else "MP3"
 
         diagnostics['is_esp_client'] = is_esp_client
         # Keep ESP responses minimal to avoid JSON parsing/memory issues on device.
@@ -452,6 +458,7 @@ def api_process_audio():
                 minimal_payload['audio_url'] = response_payload['audio_url']
                 minimal_payload['audio_id'] = response_payload.get('audio_id')
                 minimal_payload['audio_mime'] = response_payload.get('audio_mime')
+                minimal_payload['audio_encoding'] = response_payload.get('audio_encoding')
             return jsonify(minimal_payload)
         return jsonify(response_payload)
 
@@ -591,7 +598,7 @@ def main():
         except Exception as e:
             print("Gagal:", e)
 
-def synthesize_speech(text, output_path):
+def synthesize_speech(text, output_path, encoding=texttospeech.AudioEncoding.MP3):
     client = texttospeech.TextToSpeechClient()
     input_text = texttospeech.SynthesisInput(text=text)
     # Pilih voice yang natural
@@ -601,7 +608,7 @@ def synthesize_speech(text, output_path):
         ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
     )
     audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
+        audio_encoding=encoding,
         speaking_rate=1.0
     )
     response = client.synthesize_speech(
