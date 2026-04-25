@@ -45,6 +45,15 @@
 #ifndef INMP441_USE_LEFT
 #define INMP441_USE_LEFT true
 #endif
+#ifndef SPEAKER_VOLUME_PERCENT
+#define SPEAKER_VOLUME_PERCENT 95
+#endif
+#ifndef SPEAKER_GAIN_PERCENT
+#define SPEAKER_GAIN_PERCENT 130
+#endif
+#ifndef AUDIO_STREAM_IDLE_TIMEOUT_MS
+#define AUDIO_STREAM_IDLE_TIMEOUT_MS 1200
+#endif
 const size_t RECORD_SIZE = I2S_SAMPLE_RATE * 2 * RECORD_TIME;
 uint8_t* audioBuffer = nullptr;
 size_t audioDataSize = 0;
@@ -568,38 +577,255 @@ void showError(const char* title, const char* detail) {
     display.sendBuffer();
 }
 
+size_t monoToStereoWithGain(const uint8_t* monoPcmBytes, size_t monoByteLen, uint8_t* stereoOut, size_t stereoOutCapacity) {
+    if (monoPcmBytes == nullptr || stereoOut == nullptr || monoByteLen < 2 || stereoOutCapacity < 4) return 0;
+    size_t monoSampleCount = monoByteLen / sizeof(int16_t);
+    size_t maxStereoSamples = stereoOutCapacity / (sizeof(int16_t) * 2);
+    if (monoSampleCount > maxStereoSamples) monoSampleCount = maxStereoSamples;
+
+    const int16_t* mono = (const int16_t*)monoPcmBytes;
+    int16_t* stereo = (int16_t*)stereoOut;
+    for (size_t i = 0; i < monoSampleCount; i++) {
+        int32_t scaled = ((int32_t)mono[i] * (int32_t)SPEAKER_VOLUME_PERCENT) / 100;
+        scaled = (scaled * (int32_t)SPEAKER_GAIN_PERCENT) / 100;
+        if (scaled > 32767) scaled = 32767;
+        if (scaled < -32768) scaled = -32768;
+        int16_t sample = (int16_t)scaled;
+        stereo[i * 2] = sample;      // Left
+        stereo[i * 2 + 1] = sample;  // Right
+    }
+    return monoSampleCount * sizeof(int16_t) * 2;
+}
+
+// Parse WAV header properly — find the "data" chunk offset.
+// Returns the byte offset where PCM data starts, or -1 on failure.
+// This handles WAV files with extra chunks (fact, LIST, etc.) before "data".
+int parseWavHeaderFromStream(WiFiClient* stream) {
+    // Read the fixed RIFF header (12 bytes): "RIFF" + size + "WAVE"
+    uint8_t riff[12];
+    int got = 0;
+    unsigned long t0 = millis();
+    while (got < 12) {
+        if (millis() - t0 > 2000) return -1;
+        int r = stream->read(riff + got, 12 - got);
+        if (r > 0) got += r;
+        else delay(1);
+    }
+    if (memcmp(riff, "RIFF", 4) != 0 || memcmp(riff + 8, "WAVE", 4) != 0) {
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] Not a valid WAV file");
+        return -1;
+    }
+
+    // Walk chunks until we find "data"
+    int totalSkipped = 12;
+    for (int attempt = 0; attempt < 16; attempt++) {
+        // Read 8-byte chunk header: 4-byte ID + 4-byte size (little-endian)
+        uint8_t chunkHdr[8];
+        got = 0;
+        t0 = millis();
+        while (got < 8) {
+            if (millis() - t0 > 2000) return -1;
+            int r = stream->read(chunkHdr + got, 8 - got);
+            if (r > 0) got += r;
+            else delay(1);
+        }
+        totalSkipped += 8;
+
+        uint32_t chunkSize = (uint32_t)chunkHdr[4]
+                           | ((uint32_t)chunkHdr[5] << 8)
+                           | ((uint32_t)chunkHdr[6] << 16)
+                           | ((uint32_t)chunkHdr[7] << 24);
+
+        if (memcmp(chunkHdr, "data", 4) == 0) {
+            // Found PCM data chunk — stream is now positioned at first PCM byte
+            if (DEBUG_SERIAL) Serial.printf("[AUDIO] WAV data chunk found at offset %d, size=%u\n",
+                                            totalSkipped, (unsigned int)chunkSize);
+            return totalSkipped;
+        }
+
+        // Skip this chunk's payload (e.g. "fmt ", "fact", "LIST", etc.)
+        if (DEBUG_SERIAL) {
+            char id[5] = {0};
+            memcpy(id, chunkHdr, 4);
+            Serial.printf("[AUDIO] Skipping WAV chunk '%s' size=%u\n", id, (unsigned int)chunkSize);
+        }
+        uint32_t remaining = chunkSize;
+        uint8_t skipBuf[64];
+        t0 = millis();
+        while (remaining > 0) {
+            if (millis() - t0 > 3000) return -1;
+            size_t want = (remaining < sizeof(skipBuf)) ? remaining : sizeof(skipBuf);
+            int r = stream->read(skipBuf, want);
+            if (r > 0) {
+                remaining -= r;
+                totalSkipped += r;
+            } else {
+                delay(1);
+            }
+        }
+        // WAV chunks are word-aligned (pad byte if odd size)
+        if (chunkSize & 1) {
+            uint8_t pad;
+            stream->read(&pad, 1);
+            totalSkipped++;
+        }
+    }
+
+    if (DEBUG_SERIAL) Serial.println("[AUDIO] WAV data chunk not found");
+    return -1;
+}
+
 void playAudioFromUrl(String url) {
     if (txChan == nullptr || url.length() == 0) return;
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Downloading: %s\n", url.c_str());
 
-    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Playing: %s\n", url.c_str());
-
+    // ── 1. Download seluruh WAV ke RAM dulu ──────────────────
     HTTPClient http;
     http.begin(url);
     int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK) {
-        WiFiClient* stream = http.getStreamPtr();
-        uint8_t buffer[1024];
-        
-        // Skip WAV header (44 bytes) to reach PCM data
-        int skipped = 0;
-        while (skipped < 44 && stream->connected()) {
-            int r = stream->read(buffer, 44 - skipped);
-            if (r > 0) skipped += r;
-        }
-
-        while (http.connected() && stream->available() > 0) {
-            size_t bytesRead = stream->readBytes(buffer, sizeof(buffer));
-            if (bytesRead > 0) {
-                size_t bytesWritten = 0;
-                i2s_channel_write(txChan, buffer, bytesRead, &bytesWritten, portMAX_DELAY);
-            }
-        }
-        if (DEBUG_SERIAL) Serial.println("[AUDIO] Playback finished");
-    } else {
+    if (httpCode != HTTP_CODE_OK) {
         if (DEBUG_SERIAL) Serial.printf("[AUDIO] HTTP GET failed: %d\n", httpCode);
+        http.end();
+        return;
+    }
+
+    int contentLen = http.getSize(); // bisa -1 jika chunked
+    WiFiClient* stream = http.getStreamPtr();
+
+    // Alokasi buffer — pakai PSRAM jika tersedia, fallback ke heap biasa
+    const size_t MAX_AUDIO_BYTES = 256 * 1024; // 256KB, cukup untuk ~8 detik TTS 16kHz
+    uint8_t* rawBuf = nullptr;
+
+    #ifdef BOARD_HAS_PSRAM
+        rawBuf = (uint8_t*)ps_malloc(MAX_AUDIO_BYTES);
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] Using PSRAM for audio buffer");
+    #endif
+
+    if (rawBuf == nullptr) {
+        rawBuf = (uint8_t*)malloc(MAX_AUDIO_BYTES);
+    }
+
+    if (rawBuf == nullptr) {
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] ERROR: Tidak bisa alokasi buffer audio!");
+        http.end();
+        return;
+    }
+
+    // Download semua data
+    size_t totalDownloaded = 0;
+    unsigned long lastDataMs = millis();
+
+    while ((http.connected() || stream->available()) && totalDownloaded < MAX_AUDIO_BYTES) {
+        size_t avail = stream->available();
+        if (avail == 0) {
+            if (millis() - lastDataMs > 3000) {
+                if (DEBUG_SERIAL) Serial.println("[AUDIO] Download timeout");
+                break;
+            }
+            delay(2);
+            continue;
+        }
+        size_t want = avail;
+        if (want > MAX_AUDIO_BYTES - totalDownloaded) want = MAX_AUDIO_BYTES - totalDownloaded;
+        size_t got = stream->readBytes(rawBuf + totalDownloaded, want);
+        totalDownloaded += got;
+        lastDataMs = millis();
     }
     http.end();
+
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] Downloaded %u bytes\n", (unsigned int)totalDownloaded);
+
+    if (totalDownloaded < 44) {
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] Data terlalu kecil, bukan WAV valid");
+        free(rawBuf);
+        return;
+    }
+
+    // ── 2. Parse WAV header dari buffer ──────────────────────
+    // Cari offset "data" chunk
+    int dataOffset = -1;
+    if (memcmp(rawBuf, "RIFF", 4) != 0 || memcmp(rawBuf + 8, "WAVE", 4) != 0) {
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] Bukan file WAV valid");
+        free(rawBuf);
+        return;
+    }
+
+    int pos = 12;
+    while (pos + 8 <= (int)totalDownloaded) {
+        uint32_t chunkSize = rawBuf[pos+4] | (rawBuf[pos+5]<<8) | (rawBuf[pos+6]<<16) | (rawBuf[pos+7]<<24);
+        if (memcmp(rawBuf + pos, "data", 4) == 0) {
+            dataOffset = pos + 8;
+            break;
+        }
+        pos += 8 + chunkSize;
+        if (chunkSize & 1) pos++; // word align
+    }
+
+    if (dataOffset < 0) {
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] WAV data chunk tidak ditemukan");
+        free(rawBuf);
+        return;
+    }
+
+    uint8_t* pcmData  = rawBuf + dataOffset;
+    size_t   pcmBytes = totalDownloaded - dataOffset;
+    if (pcmBytes < 2) {
+        free(rawBuf);
+        return;
+    }
+    if (pcmBytes & 1) pcmBytes--; // pastikan genap
+
+    if (DEBUG_SERIAL) Serial.printf("[AUDIO] PCM offset=%d size=%u bytes (%.2fs)\n",
+        dataOffset, (unsigned int)pcmBytes, (float)pcmBytes / (16000.0f * 2.0f));
+
+    // ── 3. Putar dari RAM ke I2S — tanpa network jitter ──────
+    const size_t STEREO_BUF_SIZE = 4096; // bytes stereo per chunk
+    uint8_t* stereoBuf = (uint8_t*)malloc(STEREO_BUF_SIZE);
+    if (!stereoBuf) {
+        if (DEBUG_SERIAL) Serial.println("[AUDIO] ERROR: Tidak bisa alokasi stereo buffer");
+        free(rawBuf);
+        return;
+    }
+
+    // Silence warm-up: isi DMA dengan nol sebelum mulai
+    memset(stereoBuf, 0, STEREO_BUF_SIZE);
+    size_t dummy = 0;
+    i2s_channel_write(txChan, stereoBuf, STEREO_BUF_SIZE, &dummy, pdMS_TO_TICKS(200));
+    i2s_channel_write(txChan, stereoBuf, STEREO_BUF_SIZE, &dummy, pdMS_TO_TICKS(200));
+
+    // Putar chunk per chunk dari RAM
+    const size_t MONO_CHUNK = STEREO_BUF_SIZE / 2; // bytes mono per iterasi
+    size_t offset = 0;
+    uint32_t totalWritten = 0;
+
+    while (offset < pcmBytes) {
+        size_t chunkMono = pcmBytes - offset;
+        if (chunkMono > MONO_CHUNK) chunkMono = MONO_CHUNK;
+        if (chunkMono & 1) chunkMono--;
+
+        size_t stereoBytes = monoToStereoWithGain(pcmData + offset, chunkMono, stereoBuf, STEREO_BUF_SIZE);
+        if (stereoBytes > 0) {
+            size_t written = 0;
+            i2s_channel_write(txChan, stereoBuf, stereoBytes, &written, pdMS_TO_TICKS(500));
+            totalWritten += written;
+        }
+        offset += chunkMono;
+    }
+
+    // Silence tail: flush DMA agar tidak ada pop di akhir
+    memset(stereoBuf, 0, STEREO_BUF_SIZE);
+    i2s_channel_write(txChan, stereoBuf, STEREO_BUF_SIZE, &dummy, pdMS_TO_TICKS(200));
+    i2s_channel_write(txChan, stereoBuf, STEREO_BUF_SIZE, &dummy, pdMS_TO_TICKS(200));
+    delay(80);
+
+    if (DEBUG_SERIAL) {
+        Serial.printf("[AUDIO] Playback selesai | pcm=%u | written=%u | vol=%d%% | gain=%d%%\n",
+            (unsigned int)pcmBytes, (unsigned int)totalWritten,
+            SPEAKER_VOLUME_PERCENT, SPEAKER_GAIN_PERCENT);
+    }
+
+    free(stereoBuf);
+    free(rawBuf);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -649,10 +875,10 @@ bool postAudio() {
     free(wavBuffer);
 
     String requestBody;
-    requestBody.reserve(audioBase64.length() + 32);
+    requestBody.reserve(audioBase64.length() + 96);
     requestBody = "{\"audio\":\"";
     requestBody += audioBase64;
-    requestBody += "\"}";
+    requestBody += "\",\"include_audio\":true,\"audio_delivery\":\"url\"}";
 
     if (DEBUG_SERIAL) {
         float recordSeconds = (float)audioDataSize / (float)(I2S_SAMPLE_RATE * 2);
@@ -694,6 +920,10 @@ bool postAudio() {
         filter["question"] = true;
         filter["stage"] = true;
         filter["error"] = true;
+        filter["audio_url"] = true;
+        filter["audio_id"] = true;
+        filter["audio_mime"] = true;
+        filter["audio_encoding"] = true;
 
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
@@ -836,13 +1066,15 @@ void setup() {
 
     // Init I2S Speaker (MAX98357A) on I2S_NUM_1
     i2s_chan_config_t txChanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    i2sErr = i2s_new_channel(&txChanCfg, &txChan, NULL);
+txChanCfg.dma_desc_num  = 8;   // tambah ini (default 6)
+txChanCfg.dma_frame_num = 512; // tambah ini (default 240) → buffer lebih besar
+i2sErr = i2s_new_channel(&txChanCfg, &txChan, NULL);
     if (i2sErr != ESP_OK) {
         Serial.printf("[SPEAKER] i2s_new_channel failed: %d\n", i2sErr);
     } else {
         i2s_std_config_t txStdCfg = {
             .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
             .gpio_cfg = {
                 .mclk = I2S_GPIO_UNUSED,
                 .bclk = I2S_SPEAKER_BCLK,
