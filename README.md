@@ -2,6 +2,8 @@
 
 **Gabriel** adalah asisten suara pintar berbasis AI yang menggunakan ESP32-S3 untuk mendengarkan perintah suara, memprosesnya melalui Google Gemini, dan memberikan jawaban baik dalam bentuk teks di layar OLED maupun suara melalui speaker.
 
+> Proyek ini cocok untuk kamu yang ingin membangun **AI assistant fisik**: bisa mendengar, berpikir, menampilkan teks, dan berbicara secara natural.
+
 ---
 
 ## 🚀 Fitur Utama
@@ -9,6 +11,7 @@
 - **AI Intelligence**: Didukung oleh **Gemini 2.5 Flash** untuk jawaban yang cepat dan cerdas.
 - **Natural Voice**: Output suara jernih menggunakan Google Text-to-Speech (Wavenet).
 - **Visual Display**: Interface rapi pada layar OLED SSD1306.
+- **Modular Build**: Komponen mudah dicari dan mudah di-upgrade.
 
 ---
 
@@ -16,10 +19,25 @@
 
 | Komponen | Deskripsi |
 | :--- | :--- |
-| **Microcontroller** | ESP32-S3 (WROOM-1) |
+| **Microcontroller** | ESP32-S3 (N16R8) |
 | **Microphone** | INMP441 (I2S Digital Mic) |
 | **Speaker Amp** | MAX98357A (I2S Class-D Amp) |
 | **Display** | OLED SSD1306 128x64 (I2C) |
+
+### 💰 Estimasi Biaya Komponen
+
+> Estimasi ini membantu kamu menghitung budget awal sebelum mulai rakit.
+
+| Komponen | Harga (IDR) | Estimasi (USD) |
+| :--- | ---: | ---: |
+| MAX98357A | Rp 45.000 | $2.81 |
+| Kit Modul OLED 128 x 65 | Rp 55.500 | $3.47 |
+| ESP32-S3 N16R8 | Rp 115.000 | $7.19 |
+| Speaker 8 ohm 3 watt | Rp 15.000 | $0.94 |
+| INMP441 | Rp 60.000 | $3.75 |
+| **Total** | **Rp 290.500** | **$18.16** |
+
+**Asumsi kurs:** 1 USD = Rp 16.000 (estimasi, bisa berubah mengikuti kurs harian).
 
 ### Skema Wiring (Pinout)
 
