@@ -7,8 +7,10 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <SocketIOclient.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <esp_system.h>
 #include <driver/i2s_std.h>
 #include <mbedtls/base64.h>
 #include "config.h"
@@ -60,6 +62,9 @@ size_t audioDataSize = 0;
 i2s_chan_handle_t rxChan = nullptr;
 i2s_chan_handle_t txChan = nullptr;
 String pendingAudioUrl = "";
+SocketIOclient socketIO;
+bool socketConnected = false;
+String socketSessionId = "";
 
 inline int16_t convertI2SSampleToPCM16(int32_t sample32) {
     int32_t s = sample32 >> I2S_SAMPLE_SHIFT;
@@ -256,6 +261,18 @@ unsigned long stateStartTime = 0;
 #define LINE_HEIGHT     10
 #define MAX_CHARS_LINE  21  // 128 / 6 = 21 chars per line
 
+enum FaceMood {
+    FACE_IDLE,
+    FACE_LISTENING,
+    FACE_PROCESSING,
+    FACE_SPEAKING,
+};
+
+unsigned long nextBlinkMs = 0;
+unsigned long blinkEndMs = 0;
+unsigned long lastFaceDrawMs = 0;
+bool eyesClosed = false;
+
 // ═══════════════════════════════════════════════════════════
 // BOOT ANIMATION
 // ═══════════════════════════════════════════════════════════
@@ -400,6 +417,77 @@ bool ensureWiFi() {
 // ═══════════════════════════════════════════════════════════
 // DISPLAY FUNCTIONS
 // ═══════════════════════════════════════════════════════════
+
+void drawFace(FaceMood mood, bool drawLabel) {
+    display.clearBuffer();
+
+    // Frame
+    display.drawRFrame(8, 8, 112, 48, 6);
+
+    // Eyes
+    if (eyesClosed) {
+        display.drawHLine(36, 26, 16);
+        display.drawHLine(76, 26, 16);
+    } else {
+        int eyeH = (mood == FACE_LISTENING) ? 14 : 10;
+        int eyeY = (mood == FACE_LISTENING) ? 18 : 20;
+        display.drawRBox(36, eyeY, 16, eyeH, 3);
+        display.drawRBox(76, eyeY, 16, eyeH, 3);
+    }
+
+    // Mouth
+    switch (mood) {
+        case FACE_LISTENING:
+            display.drawDisc(64, 42, 3, U8G2_DRAW_ALL);
+            break;
+        case FACE_PROCESSING:
+            display.drawHLine(54, 42, 20);
+            break;
+        case FACE_SPEAKING:
+            display.drawRFrame(56, 38, 16, 10, 2);
+            break;
+        case FACE_IDLE:
+        default:
+            display.drawLine(54, 42, 64, 46);
+            display.drawLine(64, 46, 74, 42);
+            break;
+    }
+
+    if (drawLabel) {
+        display.setFont(u8g2_font_5x7_tr);
+        if (mood == FACE_LISTENING) {
+            display.drawStr(44, 62, "LISTENING");
+        } else if (mood == FACE_PROCESSING) {
+            display.drawStr(42, 62, "THINKING");
+        } else if (mood == FACE_SPEAKING) {
+            display.drawStr(42, 62, "SPEAKING");
+        } else {
+            display.drawStr(46, 62, "STANDBY");
+        }
+    }
+
+    display.sendBuffer();
+}
+
+void updateFaceAnimation(FaceMood mood, bool forceDraw = false) {
+    unsigned long now = millis();
+    if (nextBlinkMs == 0) {
+        nextBlinkMs = now + 1600 + (random(0, 1400));
+    }
+
+    if (!eyesClosed && now >= nextBlinkMs) {
+        eyesClosed = true;
+        blinkEndMs = now + 120;
+    } else if (eyesClosed && now >= blinkEndMs) {
+        eyesClosed = false;
+        nextBlinkMs = now + 1400 + (random(0, 2200));
+    }
+
+    if (forceDraw || (now - lastFaceDrawMs) >= 80) {
+        drawFace(mood, true);
+        lastFaceDrawMs = now;
+    }
+}
 
 void showFetchingAnimation() {
     for (int frame = 0; frame < 6; frame++) {
@@ -864,7 +952,146 @@ void playAudioFromUrl(String url) {
 // AUDIO UPLOAD
 // ═══════════════════════════════════════════════════════════
 
+String getApiHost() {
+    String base = String(API_BASE_URL);
+    if (base.startsWith("https://")) base = base.substring(8);
+    if (base.startsWith("http://")) base = base.substring(7);
+    int slash = base.indexOf('/');
+    if (slash > 0) base = base.substring(0, slash);
+    return base;
+}
+
+bool isApiTls() {
+    String base = String(API_BASE_URL);
+    return base.startsWith("https://");
+}
+
+void socketIOEvent(socketIOmessageType_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        case sIOtype_CONNECT:
+            socketConnected = true;
+            socketIO.send(sIOtype_CONNECT, "/");
+            if (DEBUG_SERIAL) Serial.println("[SIO] Connected");
+            break;
+        case sIOtype_DISCONNECT:
+            socketConnected = false;
+            socketSessionId = "";
+            if (DEBUG_SERIAL) Serial.println("[SIO] Disconnected");
+            break;
+        case sIOtype_EVENT: {
+            JsonDocument root;
+            if (deserializeJson(root, payload, length) != DeserializationError::Ok || !root.is<JsonArray>()) {
+                return;
+            }
+            JsonArray arr = root.as<JsonArray>();
+            if (arr.size() < 2) return;
+            const char* eventName = arr[0] | "";
+            if (strcmp(eventName, "message") != 0) return;
+
+            JsonDocument msgDoc;
+            JsonVariant msgVariant = arr[1];
+            if (msgVariant.is<const char*>()) {
+                if (deserializeJson(msgDoc, msgVariant.as<const char*>()) != DeserializationError::Ok) return;
+            } else {
+                msgDoc.set(msgVariant);
+            }
+
+            const char* msgType = msgDoc["type"] | "";
+            if (strcmp(msgType, "connected") == 0) {
+                socketSessionId = String((const char*)msgDoc["session_id"] | "");
+            } else if (strcmp(msgType, "result") == 0) {
+                strncpy(currentMessage, msgDoc["answer"] | "No message", MAX_MSG_LENGTH - 1);
+                currentMessage[MAX_MSG_LENGTH - 1] = '\0';
+                strncpy(currentCategory, "chat", sizeof(currentCategory) - 1);
+                currentCategory[sizeof(currentCategory) - 1] = '\0';
+                const char* audioUrl = msgDoc["audio_url"] | "";
+                pendingAudioUrl = strlen(audioUrl) > 0 ? (String(API_BASE_URL) + audioUrl) : "";
+            } else if (strcmp(msgType, "error") == 0) {
+                const char* err = msgDoc["message"] | "SocketIO error";
+                strncpy(currentMessage, err, MAX_MSG_LENGTH - 1);
+                currentMessage[MAX_MSG_LENGTH - 1] = '\0';
+                strncpy(currentCategory, "error", sizeof(currentCategory) - 1);
+                currentCategory[sizeof(currentCategory) - 1] = '\0';
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+bool ensureSocketConnected() {
+    if (!USE_SOCKET_IO) return false;
+    if (!ensureWiFi()) return false;
+    if (socketConnected && socketSessionId.length() > 0) return true;
+
+    String host = getApiHost();
+    if (host.length() == 0) return false;
+    if (isApiTls()) {
+        socketIO.beginSSL(host.c_str(), 443, "/socket.io/?EIO=4");
+    } else {
+        socketIO.begin(host.c_str(), 80, "/socket.io/?EIO=4");
+    }
+    socketIO.onEvent(socketIOEvent);
+    socketIO.setReconnectInterval(3000);
+
+    unsigned long start = millis();
+    while (millis() - start < 12000) {
+        socketIO.loop();
+        if (socketConnected && socketSessionId.length() > 0) return true;
+        delay(10);
+    }
+    return false;
+}
+
+bool postAudioViaSocketIO() {
+    if (!ensureSocketConnected()) return false;
+    if (audioBuffer == nullptr || audioDataSize < 2) return false;
+
+    const size_t CHUNK = 4096;
+    size_t offset = 0;
+    while (offset < audioDataSize) {
+        size_t n = audioDataSize - offset;
+        if (n > CHUNK) n = CHUNK;
+        socketIO.sendBIN(audioBuffer + offset, n);
+        offset += n;
+        socketIO.loop();
+        delay(2);
+    }
+
+    JsonDocument endDoc;
+    JsonArray endArr = endDoc.to<JsonArray>();
+    endArr.add("message");
+    JsonObject endMsg = endArr.add<JsonObject>();
+    endMsg["type"] = "audio_end";
+    String endPayload;
+    serializeJson(endDoc, endPayload);
+    socketIO.sendEVENT(endPayload);
+
+    unsigned long start = millis();
+    while (millis() - start < SOCKET_IO_RESPONSE_TIMEOUT_MS) {
+        socketIO.loop();
+        if (strcmp(currentCategory, "chat") == 0 || strcmp(currentCategory, "error") == 0) {
+            return strcmp(currentCategory, "chat") == 0;
+        }
+        delay(10);
+    }
+
+    strncpy(currentMessage, "SocketIO timeout", MAX_MSG_LENGTH - 1);
+    currentMessage[MAX_MSG_LENGTH - 1] = '\0';
+    strncpy(currentCategory, "error", sizeof(currentCategory) - 1);
+    currentCategory[sizeof(currentCategory) - 1] = '\0';
+    return false;
+}
+
 bool postAudio() {
+    currentCategory[0] = '\0';
+    currentMessage[0] = '\0';
+
+    if (USE_SOCKET_IO && postAudioViaSocketIO()) {
+        return true;
+    }
+
     if (!ensureWiFi()) {
         strncpy(currentMessage, "WiFi terputus", MAX_MSG_LENGTH);
         return false;
@@ -1145,11 +1372,8 @@ i2sErr = i2s_new_channel(&txChanCfg, &txChan, NULL);
                   I2S_SAMPLE_RATE, I2S_SAMPLE_SHIFT, RECORD_TIME, (unsigned int)RECORD_SIZE, MIN_UPLOAD_PEAK);
     Serial.println("[SETUP] Entering VAD Standby Mode...");
     
-    // Initial UI
-    display.clearBuffer();
-    display.setFont(u8g2_font_6x10_tr);
-    display.drawStr(36, 36, "Standby");
-    display.sendBuffer();
+    randomSeed((uint32_t)esp_random());
+    updateFaceAnimation(FACE_IDLE, true);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1166,8 +1390,9 @@ void loop() {
             
             // Read a small chunk of audio to detect voice
             if (rxChan != nullptr) {
-                i2s_channel_read(rxChan, sampleBuffer, sizeof(sampleBuffer), &bytesRead, portMAX_DELAY);
+                i2s_channel_read(rxChan, sampleBuffer, sizeof(sampleBuffer), &bytesRead, pdMS_TO_TICKS(20));
             }
+            updateFaceAnimation(FACE_IDLE);
             
             int samples = bytesRead / sizeof(int32_t);
             if (samples > 0) {
@@ -1201,10 +1426,7 @@ void loop() {
                     vadHitCount = 0;
                     flushI2SInput(); // flush to start clean recording
                     
-                    display.clearBuffer();
-                    display.setFont(u8g2_font_6x10_tr);
-                    display.drawStr(28, 36, "Listening...");
-                    display.sendBuffer();
+                    updateFaceAnimation(FACE_LISTENING, true);
                 }
             }
             break;
@@ -1271,21 +1493,21 @@ void loop() {
                                   stopBySilence ? "silence" : "buffer_full");
                 }
                 
-                display.clearBuffer();
-                display.setFont(u8g2_font_6x10_tr);
-                display.drawStr(28, 36, "Processing...");
-                display.sendBuffer();
+                updateFaceAnimation(FACE_PROCESSING, true);
             }
+            updateFaceAnimation(FACE_LISTENING);
             break;
         }
         
         case STATE_PROCESSING: {
+            updateFaceAnimation(FACE_PROCESSING, true);
             if (DEBUG_SERIAL) Serial.printf("[AUDIO] Finished. Size: %d bytes\n", audioDataSize);
             
             if (postAudio()) {
                 fetchCount++;
                 showMessageWithTypewriter();
                 if (pendingAudioUrl.length() > 0) {
+                    updateFaceAnimation(FACE_SPEAKING, true);
                     playAudioFromUrl(pendingAudioUrl);
                     pendingAudioUrl = "";
                 }
@@ -1340,16 +1562,9 @@ void loop() {
                     silenceStartMs = 0;
                     flushI2SInput();
 
-                    display.clearBuffer();
-                    display.setFont(u8g2_font_6x10_tr);
-                    display.drawStr(28, 36, "Listening...");
-                    display.sendBuffer();
+                    updateFaceAnimation(FACE_LISTENING, true);
                 } else {
-                    display.clearBuffer();
-                    display.setFont(u8g2_font_6x10_tr);
-                    display.drawStr(36, 36, "Standby");
-                    display.sendBuffer();
-
+                    updateFaceAnimation(FACE_IDLE, true);
                     flushI2SInput();
                 }
             }
@@ -1366,6 +1581,10 @@ void loop() {
             ensureWiFi();
         }
         lastWiFiCheck = now;
+    }
+
+    if (USE_SOCKET_IO) {
+        socketIO.loop();
     }
     
     delay(10); // Small delay to prevent watchdog reset
