@@ -33,9 +33,9 @@
 | MAX98357A | Rp 45.000 | $2.81 |
 | Kit Modul OLED 128 x 65 | Rp 55.500 | $3.47 |
 | ESP32-S3 N16R8 | Rp 115.000 | $7.19 |
-| Speaker 8 ohm 3 watt | Rp 15.000 | $0.94 |
+| Speaker 8 ohm 3 watt | Rp 23.000 | $1.33 |
 | INMP441 | Rp 60.000 | $3.75 |
-| **Total** | **Rp 290.500** | **$18.16** |
+| **Total** | **Rp 298.500** | **$18.55** |
 
 **Asumsi kurs:** 1 USD = Rp 16.000 (estimasi, bisa berubah mengikuti kurs harian).
 
