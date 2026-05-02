@@ -7,7 +7,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <SocketIOclient.h>
+#include <WebSocketsClient.h>   // Native WS — supports binary frames
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <esp_system.h>
@@ -62,9 +62,13 @@ size_t audioDataSize = 0;
 i2s_chan_handle_t rxChan = nullptr;
 i2s_chan_handle_t txChan = nullptr;
 String pendingAudioUrl = "";
-SocketIOclient socketIO;
-bool socketConnected = false;
-String socketSessionId = "";
+
+// ── WebSocket (raw binary, Socket.IO-like protocol) ──────────
+WebSocketsClient wsClient;
+bool wsConnected   = false;
+bool wsHandshook   = false;   // received 'connected' event from server
+String wsSessionId = "";
+uint8_t wsSidBuf[24] = {0};    // Engine.IO sid buffer
 
 inline int16_t convertI2SSampleToPCM16(int32_t sample32) {
     int32_t s = sample32 >> I2S_SAMPLE_SHIFT;
@@ -966,118 +970,205 @@ bool isApiTls() {
     return base.startsWith("https://");
 }
 
-void socketIOEvent(socketIOmessageType_t type, uint8_t* payload, size_t length) {
+// ── WebSocket Event Handler ──────────────────────────────────
+// Handles Socket.IO over raw WebSocket:
+//   • Engine.IO handshake (packet '0' = OPEN, '40' = CONNECT OK)
+//   • Socket.IO message events ('42["message",{...}]')
+//   • Binary audio frames sent by sendBIN
+void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
-        case sIOtype_CONNECT:
-            socketConnected = true;
-            socketIO.send(sIOtype_CONNECT, "/");
-            if (DEBUG_SERIAL) Serial.println("[SIO] Connected");
+        case WStype_DISCONNECTED:
+            wsConnected  = false;
+            wsHandshook  = false;
+            wsSessionId  = "";
+            if (DEBUG_SERIAL) Serial.println("[WS] Disconnected");
             break;
-        case sIOtype_DISCONNECT:
-            socketConnected = false;
-            socketSessionId = "";
-            if (DEBUG_SERIAL) Serial.println("[SIO] Disconnected");
-            break;
-        case sIOtype_EVENT: {
-            JsonDocument root;
-            if (deserializeJson(root, payload, length) != DeserializationError::Ok || !root.is<JsonArray>()) {
-                return;
-            }
-            JsonArray arr = root.as<JsonArray>();
-            if (arr.size() < 2) return;
-            const char* eventName = arr[0] | "";
-            if (strcmp(eventName, "message") != 0) return;
 
-            JsonDocument msgDoc;
-            JsonVariant msgVariant = arr[1];
-            if (msgVariant.is<const char*>()) {
-                if (deserializeJson(msgDoc, msgVariant.as<const char*>()) != DeserializationError::Ok) return;
-            } else {
-                msgDoc.set(msgVariant);
+        case WStype_CONNECTED:
+            wsConnected = true;
+            if (DEBUG_SERIAL) Serial.printf("[WS] TCP connected to %s\n", (char*)payload);
+            // Engine.IO will immediately send "0{...}" OPEN packet — we wait for it.
+            break;
+
+        case WStype_TEXT: {
+            if (length == 0) break;
+            char* text = (char*)payload;
+            if (DEBUG_SERIAL) Serial.printf("[WS] TEXT: %.120s\n", text);
+
+            // Engine.IO OPEN packet: starts with '0'
+            if (text[0] == '0') {
+                // Reply with Socket.IO connect: '40'
+                wsClient.sendTXT("40");
+                break;
             }
 
-            const char* msgType = msgDoc["type"] | "";
-            if (strcmp(msgType, "connected") == 0) {
-                socketSessionId = String((const char*)msgDoc["session_id"] | "");
-            } else if (strcmp(msgType, "result") == 0) {
-                strncpy(currentMessage, msgDoc["answer"] | "No message", MAX_MSG_LENGTH - 1);
-                currentMessage[MAX_MSG_LENGTH - 1] = '\0';
-                strncpy(currentCategory, "chat", sizeof(currentCategory) - 1);
-                currentCategory[sizeof(currentCategory) - 1] = '\0';
-                const char* audioUrl = msgDoc["audio_url"] | "";
-                pendingAudioUrl = strlen(audioUrl) > 0 ? (String(API_BASE_URL) + audioUrl) : "";
-            } else if (strcmp(msgType, "error") == 0) {
-                const char* err = msgDoc["message"] | "SocketIO error";
-                strncpy(currentMessage, err, MAX_MSG_LENGTH - 1);
-                currentMessage[MAX_MSG_LENGTH - 1] = '\0';
-                strncpy(currentCategory, "error", sizeof(currentCategory) - 1);
-                currentCategory[sizeof(currentCategory) - 1] = '\0';
+            // Socket.IO EVENT packet: starts with '42'
+            if (length >= 2 && text[0] == '4' && text[1] == '2') {
+                // text looks like: 42["message","{...}"]
+                char* jsonPart = text + 2;  // skip '42'
+                JsonDocument root;
+                if (deserializeJson(root, jsonPart) != DeserializationError::Ok) break;
+                if (!root.is<JsonArray>()) break;
+                JsonArray arr = root.as<JsonArray>();
+                if (arr.size() < 2) break;
+                const char* eventName = arr[0] | "";
+                if (strcmp(eventName, "message") != 0) break;
+
+                // Inner payload can be a JSON string or object
+                JsonDocument msgDoc;
+                JsonVariant msgVariant = arr[1];
+                if (msgVariant.is<const char*>()) {
+                    if (deserializeJson(msgDoc, msgVariant.as<const char*>()) != DeserializationError::Ok) break;
+                } else {
+                    msgDoc.set(msgVariant);
+                }
+
+                const char* msgType = msgDoc["type"] | "";
+
+                if (strcmp(msgType, "connected") == 0) {
+                    wsSessionId = String(msgDoc["session_id"] | "");
+                    wsHandshook = true;
+                    if (DEBUG_SERIAL) Serial.printf("[WS] Session: %s\n", wsSessionId.c_str());
+                }
+                else if (strcmp(msgType, "processing") == 0) {
+                    if (DEBUG_SERIAL) Serial.println("[WS] Server processing audio...");
+                }
+                else if (strcmp(msgType, "stt_result") == 0) {
+                    const char* txt = msgDoc["text"] | "";
+                    if (DEBUG_SERIAL) Serial.printf("[WS] STT: %s\n", txt);
+                }
+                else if (strcmp(msgType, "result") == 0) {
+                    strncpy(currentMessage, msgDoc["answer"] | "No message", MAX_MSG_LENGTH - 1);
+                    currentMessage[MAX_MSG_LENGTH - 1] = '\0';
+                    strncpy(currentCategory, "chat", sizeof(currentCategory) - 1);
+                    currentCategory[sizeof(currentCategory) - 1] = '\0';
+                    const char* audioUrl = msgDoc["audio_url"] | "";
+                    pendingAudioUrl = strlen(audioUrl) > 0 ? (String(API_BASE_URL) + audioUrl) : "";
+                    if (DEBUG_SERIAL) Serial.printf("[WS] Answer: %s\n", currentMessage);
+                }
+                else if (strcmp(msgType, "error") == 0) {
+                    strncpy(currentMessage, msgDoc["message"] | "WS error", MAX_MSG_LENGTH - 1);
+                    currentMessage[MAX_MSG_LENGTH - 1] = '\0';
+                    strncpy(currentCategory, "error", sizeof(currentCategory) - 1);
+                    currentCategory[sizeof(currentCategory) - 1] = '\0';
+                    if (DEBUG_SERIAL) Serial.printf("[WS] Error: %s\n", currentMessage);
+                }
+                break;
             }
+
+            // Engine.IO PING? Reply PONG
+            if (text[0] == '2') { wsClient.sendTXT("3"); break; }
             break;
         }
-        default:
+
+        case WStype_ERROR:
+            if (DEBUG_SERIAL) Serial.printf("[WS] Error: %.*s\n", (int)length, (char*)payload);
             break;
+
+        default: break;
     }
 }
 
-bool ensureSocketConnected() {
+// ── Socket.IO message emit helper ────────────────────────────
+// Wraps a JSON payload as Socket.IO event: 42["message", payload]
+void wsSendMessage(const char* jsonPayload) {
+    // Build: 42["message",<payload>]
+    String frame = "42[\"message\",";
+    frame += jsonPayload;
+    frame += "]";
+    wsClient.sendTXT(frame);
+    if (DEBUG_SERIAL) Serial.printf("[WS] SEND: %.80s\n", frame.c_str());
+}
+
+bool ensureWsConnected() {
     if (!USE_SOCKET_IO) return false;
     if (!ensureWiFi()) return false;
-    if (socketConnected && socketSessionId.length() > 0) return true;
+    if (wsConnected && wsHandshook) return true;
 
     String host = getApiHost();
     if (host.length() == 0) return false;
+
+    if (DEBUG_SERIAL) Serial.printf("[WS] Connecting to %s...\n", host.c_str());
+
+    // Socket.IO endpoint — EIO=4 is Engine.IO v4 (Flask-SocketIO default)
+    String path = "/socket.io/?EIO=4&transport=websocket";
     if (isApiTls()) {
-        socketIO.beginSSL(host.c_str(), 443, "/socket.io/?EIO=4");
+        wsClient.beginSSL(host.c_str(), 443, path.c_str());
     } else {
-        socketIO.begin(host.c_str(), 80, "/socket.io/?EIO=4");
+        wsClient.begin(host.c_str(), 80, path.c_str());
     }
-    socketIO.onEvent(socketIOEvent);
-    socketIO.setReconnectInterval(3000);
+    wsClient.onEvent(wsEvent);
+    wsClient.setReconnectInterval(4000);
+    wsClient.enableHeartbeat(25000, 10000, 3);  // ping every 25s, pong timeout 10s
 
     unsigned long start = millis();
-    while (millis() - start < 12000) {
-        socketIO.loop();
-        if (socketConnected && socketSessionId.length() > 0) return true;
+    while (millis() - start < 15000) {
+        wsClient.loop();
+        if (wsConnected && wsHandshook) {
+            if (DEBUG_SERIAL) Serial.println("[WS] Handshake complete!");
+            return true;
+        }
         delay(10);
     }
+    if (DEBUG_SERIAL) Serial.println("[WS] Connection timeout");
     return false;
 }
 
-bool postAudioViaSocketIO() {
-    if (!ensureSocketConnected()) return false;
+bool postAudioViaWebSocket() {
+    if (!ensureWsConnected()) return false;
     if (audioBuffer == nullptr || audioDataSize < 2) return false;
 
-    const size_t CHUNK = 4096;
+    if (DEBUG_SERIAL) Serial.printf("[WS] Sending %u bytes audio as base64 chunks...\n", (unsigned)audioDataSize);
+
+    // Send audio as base64-encoded JSON chunks.
+    // WHY: WebSocketsClient.sendBIN() sends raw binary WebSocket frames.
+    // Flask-SocketIO cannot route raw binary frames as Socket.IO 'message' events
+    // (it expects the Socket.IO binary protocol: packet type 52-[...]).
+    // Base64 text JSON is simpler, universally compatible, and our server
+    // already supports it via the REST endpoint path in services.py.
+    const size_t CHUNK_PCM = 4096;  // 4KB PCM per chunk → ~5.5KB base64
     size_t offset = 0;
+
     while (offset < audioDataSize) {
         size_t n = audioDataSize - offset;
-        if (n > CHUNK) n = CHUNK;
-        socketIO.sendBIN(audioBuffer + offset, n);
+        if (n > CHUNK_PCM) n = CHUNK_PCM;
+
+        // Base64-encode this PCM chunk
+        String b64Chunk;
+        if (!base64Encode(audioBuffer + offset, n, b64Chunk)) {
+            if (DEBUG_SERIAL) Serial.println("[WS] base64 encode failed");
+            return false;
+        }
+
+        // Build Socket.IO text event: 42["message",{"type":"audio_chunk","data":"<b64>"}]
+        String frame = "42[\"message\",{\"type\":\"audio_chunk\",\"data\":\"";
+        frame += b64Chunk;
+        frame += "\"}]";
+        wsClient.sendTXT(frame);
+        wsClient.loop();
+        delay(5);
+
         offset += n;
-        socketIO.loop();
-        delay(2);
+        if (DEBUG_SERIAL && offset % (CHUNK_PCM * 4) == 0) {
+            Serial.printf("[WS] Sent %u / %u bytes\n", (unsigned)offset, (unsigned)audioDataSize);
+        }
     }
 
-    JsonDocument endDoc;
-    JsonArray endArr = endDoc.to<JsonArray>();
-    endArr.add("message");
-    JsonObject endMsg = endArr.add<JsonObject>();
-    endMsg["type"] = "audio_end";
-    String endPayload;
-    serializeJson(endDoc, endPayload);
-    socketIO.sendEVENT(endPayload);
+    if (DEBUG_SERIAL) Serial.println("[WS] All chunks sent. Sending audio_end...");
+    wsSendMessage("{\"type\":\"audio_end\"}");
 
+    // Wait for result or error
+    currentCategory[0] = '\0';
     unsigned long start = millis();
-    while (millis() - start < SOCKET_IO_RESPONSE_TIMEOUT_MS) {
-        socketIO.loop();
+    while (millis() - start < (unsigned long)SOCKET_IO_RESPONSE_TIMEOUT_MS) {
+        wsClient.loop();
         if (strcmp(currentCategory, "chat") == 0 || strcmp(currentCategory, "error") == 0) {
             return strcmp(currentCategory, "chat") == 0;
         }
         delay(10);
     }
 
-    strncpy(currentMessage, "SocketIO timeout", MAX_MSG_LENGTH - 1);
+    strncpy(currentMessage, "WebSocket timeout", MAX_MSG_LENGTH - 1);
     currentMessage[MAX_MSG_LENGTH - 1] = '\0';
     strncpy(currentCategory, "error", sizeof(currentCategory) - 1);
     currentCategory[sizeof(currentCategory) - 1] = '\0';
@@ -1088,7 +1179,7 @@ bool postAudio() {
     currentCategory[0] = '\0';
     currentMessage[0] = '\0';
 
-    if (USE_SOCKET_IO && postAudioViaSocketIO()) {
+    if (USE_SOCKET_IO && postAudioViaWebSocket()) {
         return true;
     }
 
@@ -1584,7 +1675,7 @@ void loop() {
     }
 
     if (USE_SOCKET_IO) {
-        socketIO.loop();
+        wsClient.loop();  // keep WebSocket alive, handle ping/pong
     }
     
     delay(10); // Small delay to prevent watchdog reset
