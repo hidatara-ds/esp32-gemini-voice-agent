@@ -458,25 +458,29 @@ void drawFaceAndTicker(FaceMood mood, int speakFrame) {
             display.drawDisc(64, 34, 3, U8G2_DRAW_ALL);
             break;
         case FACE_PROCESSING: {
-            // Three animated dots
-            int dotX = 46 + (speakFrame % 3) * 14;
-            for (int d = 0; d < 3; d++) {
-                int dx = 46 + d * 14;
-                if (dx == dotX) display.drawBox(dx, 30, 8, 8);
-                else            display.drawRBox(dx, 31, 8, 6, 2);
-            }
+            // Simple moving dot — left to right
+            int px = 44 + (speakFrame % 5) * 10;
+            display.drawDisc(px, 33, 3, U8G2_DRAW_ALL);
+            // Static base line
+            display.drawHLine(44, 33, 40);
             break;
         }
         case FACE_SPEAKING: {
-            // Animated mouth: cycle open/half/closed
-            int mh;
+            // Outline mouth (not filled) to avoid bleed artifacts
             switch (speakFrame % 4) {
-                case 0: mh = 2;  break;   // closed
-                case 1: mh = 6;  break;   // half
-                case 2: mh = 11; break;   // open
-                case 3: mh = 6;  break;   // half
+                case 0: // closed — thin line
+                    display.drawHLine(50, 35, 28);
+                    break;
+                case 1: // half open — small outline rect
+                    display.drawRFrame(50, 31, 28, 6, 2);
+                    break;
+                case 2: // open — larger outline rect
+                    display.drawRFrame(50, 28, 28, 10, 3);
+                    break;
+                case 3: // half open
+                    display.drawRFrame(50, 31, 28, 6, 2);
+                    break;
             }
-            display.drawRBox(50, 38 - mh, 28, mh, 2);
             break;
         }
         case FACE_IDLE:
@@ -485,6 +489,7 @@ void drawFaceAndTicker(FaceMood mood, int speakFrame) {
             display.drawLine(64, 38, 78, 34);
             break;
     }
+
 
     // ── Separator line ────────────────────────────────────
     display.drawHLine(0, 43, 128);
@@ -524,12 +529,19 @@ void updateFaceAnimation(FaceMood mood, bool forceDraw = false) {
         nextBlinkMs = now + 1400 + random(0, 2200);
     }
 
+    // Advance processing/speaking animation frame every 200ms
+    static unsigned long lastFrameMs = 0;
+    if (now - lastFrameMs >= 200) {
+        speakingFrame = (speakingFrame + 1) % 20;  // large modulus avoids frequent reset
+        lastFrameMs = now;
+    }
+
     // Advance ticker scroll every 35ms
     bool tickerMoved = false;
     if (tickerText.length() > 0 && (now - lastTickerMs) >= 35) {
         tickerOffset += 2;
         int tw = display.getStrWidth(tickerText.c_str());
-        if (tickerOffset >= tw + 20) tickerOffset = 0;  // seamless loop
+        if (tickerOffset >= tw + 20) tickerOffset = 0;
         lastTickerMs = now;
         tickerMoved  = true;
     }
@@ -538,6 +550,7 @@ void updateFaceAnimation(FaceMood mood, bool forceDraw = false) {
         drawFaceAndTicker(mood, speakingFrame);
         lastFaceDrawMs = now;
     }
+
 }
 
 
@@ -1507,32 +1520,35 @@ void loop() {
 
             if (postAudio()) {
                 fetchCount++;
-                // Set ticker text immediately — no typewriter delay
                 tickerText = String(currentMessage);
                 tickerOffset = 0;
-                // Play audio — mouth animates inside playAudioFromUrl
                 if (pendingAudioUrl.length() > 0) {
                     speakingFrame = 0;
                     playAudioFromUrl(pendingAudioUrl);
                     pendingAudioUrl = "";
                 }
-                // Return to idle face after speaking
+                // After speaking: idle face with ticker still scrolling
+                // Go to DISPLAY briefly so ticker is visible, then standby
                 drawFaceAndTicker(FACE_IDLE, 0);
+                currentState = STATE_DISPLAY;
+                stateStartTime = millis();
             } else {
                 showError("Voice Failed!", currentMessage);
+                currentState = STATE_DISPLAY;
+                stateStartTime = millis();
             }
-
-            currentState = STATE_DISPLAY;
-            stateStartTime = millis();
             break;
         }
 
         
         case STATE_DISPLAY: {
-            // Cek timeout normal
-            bool displayTimeout = (millis() - stateStartTime > MESSAGE_DISPLAY_MS);
+            // Keep ticker scrolling while displaying answer
+            updateFaceAnimation(FACE_IDLE);
 
-            // VAD interrupt: jika pengguna mulai bicara sebelum timeout, langsung rekam
+            // Short timeout (2s) then back to standby — mic ready again
+            bool displayTimeout = (millis() - stateStartTime > 2000);
+
+            // VAD interrupt: user speaks before timeout
             bool vadInterrupt = false;
             if (!displayTimeout && rxChan != nullptr) {
                 int32_t vadBuf[64];
@@ -1540,9 +1556,7 @@ void loop() {
                 if (i2s_channel_read(rxChan, vadBuf, sizeof(vadBuf), &vadBytes, 0) == ESP_OK && vadBytes > 0) {
                     size_t vadSamples = vadBytes / sizeof(int32_t);
                     long vadSum = 0;
-                    for (size_t i = 0; i < vadSamples; i++) {
-                        vadSum += abs(convertI2SSampleToPCM16(vadBuf[i]));
-                    }
+                    for (size_t i = 0; i < vadSamples; i++) vadSum += abs(convertI2SSampleToPCM16(vadBuf[i]));
                     int vadEnergy = (int)(vadSum / (long)vadSamples);
                     if (vadEnergy > VAD_THRESHOLD) {
                         vadHitCount++;
