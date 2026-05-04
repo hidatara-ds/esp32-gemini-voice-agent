@@ -77,6 +77,13 @@ int    tickerOffset  = 0;     // pixels scrolled (increases over time)
 unsigned long lastTickerMs = 0;
 int speakingFrame = 0;        // 0-3 for mouth open/close animation
 
+// ── Streaming audio queue ─────────────────────────────────────
+#define AUDIO_QUEUE_SIZE 8
+String audioUrlQueue[AUDIO_QUEUE_SIZE];
+int    audioQueueHead = 0;
+int    audioQueueTail = 0;
+bool   wsStreamDone   = false;   // server sent "done" packet
+
 // ── WebSocket (raw binary, Socket.IO-like protocol) ──────────
 WebSocketsClient wsClient;
 bool wsConnected   = false;
@@ -819,6 +826,7 @@ void playAudioFromUrl(String url) {
             }
         }
         // Animate speaking mouth + scroll ticker every 150ms
+        // Also pump WS to receive next sentence chunks while playing current one
         unsigned long nowAnim = millis();
         if (nowAnim - lastAnimMs >= 150) {
             speakingFrame = (speakingFrame + 1) % 4;
@@ -827,6 +835,8 @@ void playAudioFromUrl(String url) {
             if (tickerOffset >= tw2 + 20) tickerOffset = 0;
             drawFaceAndTicker(FACE_SPEAKING, speakingFrame);
             lastAnimMs = nowAnim;
+            // Receive queued WS messages while playing (next sentence arrives here)
+            if (USE_SOCKET_IO && wsConnected) wsClient.loop();
         }
         offset2 += monoChunk;
     }
@@ -882,6 +892,23 @@ bool isApiTls() {
 //   • Engine.IO handshake (packet '0' = OPEN, '40' = CONNECT OK)
 //   • Socket.IO message events ('42["message",{...}]')
 //   • Binary audio frames sent by sendBIN
+// ── Audio queue helpers ───────────────────────────────────────
+bool audioQueuePush(const String& url) {
+    int next = (audioQueueTail + 1) % AUDIO_QUEUE_SIZE;
+    if (next == audioQueueHead) return false;  // full
+    audioUrlQueue[audioQueueTail] = url;
+    audioQueueTail = next;
+    return true;
+}
+bool audioQueuePop(String& out) {
+    if (audioQueueHead == audioQueueTail) return false;  // empty
+    out = audioUrlQueue[audioQueueHead];
+    audioQueueHead = (audioQueueHead + 1) % AUDIO_QUEUE_SIZE;
+    return true;
+}
+bool audioQueueIsEmpty() { return audioQueueHead == audioQueueTail; }
+void audioQueueReset() { audioQueueHead = audioQueueTail = 0; }
+
 void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
         case WStype_DISCONNECTED:
@@ -944,20 +971,52 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                     const char* txt = msgDoc["text"] | "";
                     if (DEBUG_SERIAL) Serial.printf("[WS] STT: %s\n", txt);
                 }
+                // ── Streaming: server sends one audio_ready per sentence ──
+                else if (strcmp(msgType, "audio_ready") == 0) {
+                    const char* url = msgDoc["audio_url"] | "";
+                    if (strlen(url) > 0) {
+                        String fullUrl = String(url);
+                        if (!fullUrl.startsWith("http")) fullUrl = String(API_BASE_URL) + fullUrl;
+                        audioQueuePush(fullUrl);
+                    }
+                    // Accumulate text into ticker
+                    const char* ct = msgDoc["text"] | "";
+                    if (strlen(ct) > 0) {
+                        if (tickerText.length() == 0) tickerText = String(ct);
+                        else tickerText += String(" ") + String(ct);
+                        tickerOffset = 0;
+                    }
+                    if (DEBUG_SERIAL) Serial.printf("[WS] audio_ready: %s\n", url);
+                }
+                // ── Streaming: server done sending all sentences ──
+                else if (strcmp(msgType, "done") == 0) {
+                    const char* ans = msgDoc["full_answer"] | "";
+                    if (strlen(ans) > 0) {
+                        strncpy(currentMessage, ans, MAX_MSG_LENGTH - 1);
+                        currentMessage[MAX_MSG_LENGTH - 1] = '\0';
+                    }
+                    strncpy(currentCategory, "chat", sizeof(currentCategory) - 1);
+                    wsStreamDone = true;
+                    if (DEBUG_SERIAL) Serial.println("[WS] Stream done");
+                }
+                // ── Legacy: single result packet (fallback) ──
                 else if (strcmp(msgType, "result") == 0) {
                     strncpy(currentMessage, msgDoc["answer"] | "No message", MAX_MSG_LENGTH - 1);
                     currentMessage[MAX_MSG_LENGTH - 1] = '\0';
                     strncpy(currentCategory, "chat", sizeof(currentCategory) - 1);
-                    currentCategory[sizeof(currentCategory) - 1] = '\0';
                     const char* audioUrl = msgDoc["audio_url"] | "";
-                    pendingAudioUrl = strlen(audioUrl) > 0 ? (String(API_BASE_URL) + audioUrl) : "";
-                    if (DEBUG_SERIAL) Serial.printf("[WS] Answer: %s\n", currentMessage);
+                    if (strlen(audioUrl) > 0) {
+                        String fu = String(audioUrl);
+                        if (!fu.startsWith("http")) fu = String(API_BASE_URL) + fu;
+                        audioQueuePush(fu);
+                    }
+                    wsStreamDone = true;
+                    if (DEBUG_SERIAL) Serial.printf("[WS] Answer(legacy): %s\n", currentMessage);
                 }
                 else if (strcmp(msgType, "error") == 0) {
                     strncpy(currentMessage, msgDoc["message"] | "WS error", MAX_MSG_LENGTH - 1);
                     currentMessage[MAX_MSG_LENGTH - 1] = '\0';
                     strncpy(currentCategory, "error", sizeof(currentCategory) - 1);
-                    currentCategory[sizeof(currentCategory) - 1] = '\0';
                     if (DEBUG_SERIAL) Serial.printf("[WS] Error: %s\n", currentMessage);
                 }
                 break;
@@ -1025,66 +1084,70 @@ bool postAudioViaWebSocket() {
     if (!ensureWsConnected()) return false;
     if (audioBuffer == nullptr || audioDataSize < 2) return false;
 
-    if (DEBUG_SERIAL) Serial.printf("[WS] Sending %u bytes audio as base64 chunks...\n", (unsigned)audioDataSize);
+    // Reset streaming state
+    audioQueueReset();
+    wsStreamDone     = false;
+    currentCategory[0] = '\0';
+    tickerText       = "";
+    tickerOffset     = 0;
 
-    // Send audio as base64-encoded JSON chunks.
-    // WHY: WebSocketsClient.sendBIN() sends raw binary WebSocket frames.
-    // Flask-SocketIO cannot route raw binary frames as Socket.IO 'message' events
-    // (it expects the Socket.IO binary protocol: packet type 52-[...]).
-    // Base64 text JSON is simpler, universally compatible, and our server
-    // already supports it via the REST endpoint path in services.py.
-    const size_t CHUNK_PCM = 4096;  // 4KB PCM per chunk → ~5.5KB base64
+    if (DEBUG_SERIAL) Serial.printf("[WS] Sending %u bytes audio...\n", (unsigned)audioDataSize);
+
+    // Send PCM chunks as base64 JSON
+    const size_t CHUNK_PCM = 4096;
     size_t offset = 0;
-
     while (offset < audioDataSize) {
         size_t n = audioDataSize - offset;
         if (n > CHUNK_PCM) n = CHUNK_PCM;
-
-        // Base64-encode this PCM chunk
         String b64Chunk;
         if (!base64Encode(audioBuffer + offset, n, b64Chunk)) {
             if (DEBUG_SERIAL) Serial.println("[WS] base64 encode failed");
             return false;
         }
-
-        // Build Socket.IO text event: 42["message",{"type":"audio_chunk","data":"<b64>"}]
         String frame = "42[\"message\",{\"type\":\"audio_chunk\",\"data\":\"";
         frame += b64Chunk;
         frame += "\"}]";
         wsClient.sendTXT(frame);
         wsClient.loop();
         delay(5);
-
         offset += n;
-        if (DEBUG_SERIAL && offset % (CHUNK_PCM * 4) == 0) {
-            Serial.printf("[WS] Sent %u / %u bytes\n", (unsigned)offset, (unsigned)audioDataSize);
-        }
     }
-
-    if (DEBUG_SERIAL) Serial.println("[WS] All chunks sent. Sending audio_end...");
     wsSendMessage("{\"type\":\"audio_end\"}");
+    if (DEBUG_SERIAL) Serial.println("[WS] Audio sent. Waiting for streaming response...");
 
-    // Wait for result or error
-    currentCategory[0] = '\0';
+    // ── Streaming play loop ───────────────────────────────────────────────
+    // As audio_ready events arrive, play each sentence immediately.
+    // wsClient.loop() inside playAudioFromUrl() receives next sentences while playing.
     unsigned long start = millis();
     while (millis() - start < (unsigned long)SOCKET_IO_RESPONSE_TIMEOUT_MS) {
         wsClient.loop();
-        if (strcmp(currentCategory, "chat") == 0 || strcmp(currentCategory, "error") == 0) {
-            return strcmp(currentCategory, "chat") == 0;
+        updateFaceAnimation(FACE_PROCESSING);
+
+        if (strcmp(currentCategory, "error") == 0) return false;
+
+        // Play any ready sentence
+        String nextUrl;
+        while (audioQueuePop(nextUrl)) {
+            speakingFrame = 0;
+            drawFaceAndTicker(FACE_SPEAKING, 0);
+            playAudioFromUrl(nextUrl);  // pumps wsClient.loop() internally every 150ms
+            // Brief pump after each sentence
+            for (int i = 0; i < 8; i++) { wsClient.loop(); delay(8); }
         }
-        delay(10);
+
+        // Exit when server done AND queue drained
+        if (wsStreamDone && audioQueueIsEmpty()) {
+            drawFaceAndTicker(FACE_IDLE, 0);
+            return true;
+        }
+        delay(5);
     }
 
     strncpy(currentMessage, "WebSocket timeout", MAX_MSG_LENGTH - 1);
-    currentMessage[MAX_MSG_LENGTH - 1] = '\0';
     strncpy(currentCategory, "error", sizeof(currentCategory) - 1);
-    currentCategory[sizeof(currentCategory) - 1] = '\0';
     return false;
 }
 
-bool postAudio() {
-    currentCategory[0] = '\0';
-    currentMessage[0] = '\0';
 
     if (USE_SOCKET_IO && postAudioViaWebSocket()) {
         return true;

@@ -12,7 +12,7 @@
 #define API_BASE_URL "https://gabriel-api-189789290221.us-central1.run.app"
 #define API_ENDPOINT "/api/process-audio"
 #define HTTP_TIMEOUT_MS 30000
-#define USE_SOCKET_IO false  // HTTP is simpler and more reliable
+#define USE_SOCKET_IO true  // Use WebSocket for streaming pipeline
 #define SOCKET_IO_RESPONSE_TIMEOUT_MS 90000
 
 // I2S mic (INMP441) — original working values
