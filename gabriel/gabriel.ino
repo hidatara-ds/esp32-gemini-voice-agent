@@ -1149,6 +1149,10 @@ bool postAudioViaWebSocket() {
 }
 
 
+bool postAudio() {
+    currentCategory[0] = '\0';
+    currentMessage[0] = '\0';
+
     if (USE_SOCKET_IO && postAudioViaWebSocket()) {
         return true;
     }
