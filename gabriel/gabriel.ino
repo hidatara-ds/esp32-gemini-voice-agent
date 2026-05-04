@@ -75,6 +75,7 @@ String pendingAudioUrl = "";
 String tickerText    = "";    // answer text scrolling below face
 int    tickerOffset  = 0;     // pixels scrolled (increases over time)
 unsigned long lastTickerMs = 0;
+unsigned long lastRequestMs = 0;
 int speakingFrame = 0;        // 0-3 for mouth open/close animation
 
 // ── Streaming audio queue ─────────────────────────────────────
@@ -965,11 +966,11 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                     if (DEBUG_SERIAL) Serial.printf("[WS] Session: %s\n", wsSessionId.c_str());
                 }
                 else if (strcmp(msgType, "processing") == 0) {
-                    if (DEBUG_SERIAL) Serial.println("[WS] Server processing audio...");
+                    if (DEBUG_SERIAL) Serial.printf("[WS] Server processing audio... (+%lu ms)\n", millis() - lastRequestMs);
                 }
                 else if (strcmp(msgType, "stt_result") == 0) {
                     const char* txt = msgDoc["text"] | "";
-                    if (DEBUG_SERIAL) Serial.printf("[WS] STT: %s\n", txt);
+                    if (DEBUG_SERIAL) Serial.printf("[WS] STT (+%lu ms): %s\n", millis() - lastRequestMs, txt);
                 }
                 // ── Streaming: server sends one audio_ready per sentence ──
                 else if (strcmp(msgType, "audio_ready") == 0) {
@@ -986,7 +987,7 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                         else tickerText += String(" ") + String(ct);
                         tickerOffset = 0;
                     }
-                    if (DEBUG_SERIAL) Serial.printf("[WS] audio_ready: %s\n", url);
+                    if (DEBUG_SERIAL) Serial.printf("[WS] audio_ready (+%lu ms): %s\n", millis() - lastRequestMs, url);
                 }
                 // ── Streaming: server done sending all sentences ──
                 else if (strcmp(msgType, "done") == 0) {
@@ -997,7 +998,7 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                     }
                     strncpy(currentCategory, "chat", sizeof(currentCategory) - 1);
                     wsStreamDone = true;
-                    if (DEBUG_SERIAL) Serial.println("[WS] Stream done");
+                    if (DEBUG_SERIAL) Serial.printf("[WS] Stream done (+%lu ms)\n", millis() - lastRequestMs);
                 }
                 // ── Legacy: single result packet (fallback) ──
                 else if (strcmp(msgType, "result") == 0) {
@@ -1091,6 +1092,7 @@ bool postAudioViaWebSocket() {
     tickerText       = "";
     tickerOffset     = 0;
 
+    unsigned long uploadStartMs = millis();
     if (DEBUG_SERIAL) Serial.printf("[WS] Sending %u bytes audio...\n", (unsigned)audioDataSize);
 
     // Send PCM chunks as base64 JSON
@@ -1113,7 +1115,8 @@ bool postAudioViaWebSocket() {
         offset += n;
     }
     wsSendMessage("{\"type\":\"audio_end\"}");
-    if (DEBUG_SERIAL) Serial.println("[WS] Audio sent. Waiting for streaming response...");
+    lastRequestMs = millis();
+    if (DEBUG_SERIAL) Serial.printf("[WS] Audio sent in %lu ms. Waiting for response...\n", lastRequestMs - uploadStartMs);
 
     // ── Streaming play loop ───────────────────────────────────────────────
     // As audio_ready events arrive, play each sentence immediately.
