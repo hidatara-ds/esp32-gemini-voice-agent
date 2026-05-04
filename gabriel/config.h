@@ -11,11 +11,11 @@
 // API
 #define API_BASE_URL "https://gabriel-api-189789290221.us-central1.run.app"
 #define API_ENDPOINT "/api/process-audio"
-#define HTTP_TIMEOUT_MS 25000
-#define USE_SOCKET_IO true
-#define SOCKET_IO_RESPONSE_TIMEOUT_MS 45000
+#define HTTP_TIMEOUT_MS 30000
+#define USE_SOCKET_IO false  // HTTP is simpler and more reliable
+#define SOCKET_IO_RESPONSE_TIMEOUT_MS 90000
 
-// I2S mic (INMP441)
+// I2S mic (INMP441) — original working values
 #define I2S_SCK GPIO_NUM_5
 #define I2S_WS GPIO_NUM_4
 #define I2S_SD GPIO_NUM_6
@@ -27,14 +27,14 @@
 #define VAD_STOP_THRESHOLD 120
 #define VAD_SILENCE_MS 700
 #define MIN_UPLOAD_PEAK 200
-#define MIC_DIAG_ON_BOOT true
+#define MIC_DIAG_ON_BOOT false
 #define MIC_DIAG_DURATION_MS 2500
 
 // OLED (SSD1306 I2C)
 #define OLED_SDA GPIO_NUM_8
 #define OLED_SCL GPIO_NUM_9
 
-// I2S Speaker (MAX98357A)
+// I2S Speaker (MAX98357A) — SD pin hard-wired to 3.3V
 #define I2S_SPEAKER_BCLK GPIO_NUM_40
 #define I2S_SPEAKER_LRC  GPIO_NUM_41
 #define I2S_SPEAKER_DIN  GPIO_NUM_42
