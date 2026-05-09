@@ -84,72 +84,52 @@ System flow:
 
 ---
 
-### Beginner-Friendly Setup
-### 1) Backend (`gabriel`) Setup
-#### Prerequisites
-- Python 3.10+
-- Docker Desktop (or Docker Engine)
-- Google Cloud SDK (`gcloud`)
-- A GCP project with APIs enabled:
-  - Vertex AI API
-  - Speech-to-Text API
-  - Text-to-Speech API
-  - Cloud Run Admin API
-  - Artifact Registry API
+## 🛠️ Kebutuhan Hardware
 
-#### Step-by-step
-```bash
-# 1) Go to backend folder (example)
-cd "cloud-api/gabriel"
+| Komponen | Deskripsi |
+| :--- | :--- |
+| **Microcontroller** | ESP32-S3 (N16R8) |
+| **Microphone** | INMP441 (I2S Digital Mic) |
+| **Speaker Amp** | MAX98357A (I2S Class-D Amp) |
+| **Display** | OLED SSD1306 128x64 (I2C) |
 
-# 2) Create virtual environment
-python -m venv .venv
+### 💰 Estimasi Biaya Komponen
 
-# 3) Activate venv (PowerShell)
-.venv\Scripts\Activate.ps1
+> Estimasi ini membantu kamu menghitung budget awal sebelum mulai rakit.
 
-# 4) Install dependencies
-pip install -r requirements.txt
+| Komponen | Harga (IDR) | Estimasi (USD) |
+| :--- | ---: | ---: |
+| MAX98357A | Rp 45.000 | $2.81 |
+| Kit Modul OLED 128 x 65 | Rp 55.500 | $3.47 |
+| ESP32-S3 N16R8 | Rp 115.000 | $7.19 |
+| Speaker 8 ohm 3 watt | Rp 23.000 | $1.33 |
+| INMP441 | Rp 60.000 | $3.75 |
+| **Total** | **Rp 298.500** | **$18.55** |
 
-# 5) Create local env file (DO NOT COMMIT)
-# File: .env
-```
+**Asumsi kurs:** 1 USD = Rp 16.000 (estimasi, bisa berubah mengikuti kurs harian).
 
-Example `.env` template:
-```env
-FLASK_ENV=production
-PORT=8080
-GOOGLE_CLOUD_PROJECT_ID=your-gcp-project-id
-GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
-GEMINI_API_KEY=YOUR_GEMINI_API_KEY
-API_BASE_URL=https://your-cloud-run-service.a.run.app
-```
+### Skema Wiring (Pinout)
 
-Run locally:
-```bash
-python app.py
-```
+#### 🎙️ Mikrofon (INMP441)
+- **SCK** -> GPIO 5
+- **WS** -> GPIO 4
+- **SD** -> GPIO 6
+- **L/R** -> GND
+- **VDD** -> 3.3V
+- **GND** -> GND
 
-### 2) ESP32-S3 Firmware Setup
-#### Prerequisites
-- Arduino IDE 2.x (or PlatformIO)
-- ESP32 board package installed
-- USB data cable
-- Required libraries:
-  - ArduinoJson
-  - U8g2
+#### 🔊 Speaker (MAX98357A)
+- **BCLK** -> GPIO 40
+- **LRC** -> GPIO 41
+- **DIN** -> GPIO 42
+- **VIN** -> 5V (Disarankan)
+- **GND** -> GND
 
-#### Step-by-step
-1. Open firmware project (example path): `firmware-gabriel-buddy/gabriel`.
-2. Update configuration placeholders in firmware config file:
-   - `WIFI_SSID="<WIFI_SSID>"`
-   - `WIFI_PASSWORD="<WIFI_PASSWORD>"`
-   - `API_BASE_URL="https://your-cloud-run-service.a.run.app"`
-3. In Arduino IDE:
-   - Board: `ESP32S3 Dev Module`
-   - PSRAM: enabled (`OPI` or `QSPI` per board)
-4. Connect ESP32-S3 via USB.
-5. Click Upload, then open Serial Monitor to verify Wi-Fi + backend connection.
+#### 📺 Display (OLED SSD1306)
+- **SDA** -> GPIO 8
+- **SCL** -> GPIO 9
+- **VCC** -> 3.3V
+- **GND** -> GND
 
 ---
 
