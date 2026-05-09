@@ -13,7 +13,7 @@
 
 ## Demo & Hardware Setup
 
-![Hardware Setup](assets/hardware_setup.png)
+![Hardware Setup](assets/hardware.png)
 
 **Watch the demos:**
 - [Demo 1 Video](assets/demo_1.mp4)
