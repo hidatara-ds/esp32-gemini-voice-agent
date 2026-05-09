@@ -11,6 +11,16 @@
 
 ---
 
+## Demo & Hardware Setup
+
+![Hardware Setup](assets/hardware_setup.jpg)
+
+**Watch the demos:**
+- [Demo 1 Video](assets/demo_1.mp4)
+- [Demo 2 Video](assets/demo_2.mp4)
+
+---
+
 ## English
 
 ### Executive Summary
