@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gabriel AI — Voice Assistant API</title>
+  <meta name="description" content="Gabriel AI Voice Assistant — WebSocket real-time audio, Gemini 2.5 Flash, ESP32-S3 integration. Test WebSocket connections, APIs, and ESP32 firmware integration.">
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+  <!-- Socket.IO CDN -->
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- LOADING OVERLAY -->
+<div id="loadingOverlay" class="loading-overlay">
+  <div class="spinner"></div>
+  <p id="loadingText" class="loading-text">Connecting…</p>
+</div>
+
+<div class="app-wrapper">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-brand">
+      <div class="brand-icon">🤖</div>
+      <div>
+        <div class="brand-name">Gabriel AI</div>
+        <div class="brand-tagline">Voice Assistant · ESP32-S3 · Gemini 2.5</div>
+      </div>
+    </div>
+    <div class="header-status">
+      <div id="statusBadge" class="status-badge disconnected">
+        <span id="statusDot" class="status-dot"></span>
+        <span id="statusText">Disconnected</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- TABS -->
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="tab-ws">⚡ WebSocket Live</button>
+    <button class="tab-btn" data-tab="tab-api">🧪 API Test</button>
+    <button class="tab-btn" data-tab="tab-esp32">📡 ESP32 Guide</button>
+  </div>
+
+  <!-- ======================== TAB: WEBSOCKET ======================== -->
+  <div id="tab-ws" class="tab-panel active">
+    <div class="main-grid">
+
+      <!-- LEFT: ORB + CONTROLS + TRANSCRIPT -->
+      <div>
+        <!-- Orb -->
+        <div class="card" style="text-align:center;">
+          <div class="orb-wrapper">
+            <div id="orb" class="orb idle">
+              <div id="orbInner" class="orb-inner"></div>
+            </div>
+            <div id="orbLabel" class="orb-label">IDLE</div>
+          </div>
+
+          <!-- Controls -->
+          <div class="controls">
+            <button id="btnConnect" class="btn btn-primary">🔌 Connect</button>
+            <button id="btnDisconnect" class="btn btn-danger" disabled>✖ Disconnect</button>
+            <button id="btnPing" class="btn btn-ghost" disabled>📡 Ping</button>
+          </div>
+
+          <!-- VAD + Record controls -->
+          <div class="controls" style="margin-top:8px;">
+            <button id="btnVAD" class="btn btn-vad" disabled>🎧 Always Listen</button>
+            <button id="btnRecord" class="btn btn-record" disabled>🎙 Push to Talk</button>
+          </div>
+
+          <!-- Audio Level Bar -->
+          <div id="audioLevelWrap" style="display:none;margin:12px 0 4px;">
+            <div style="font-size:10px;color:var(--slate-500);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Mic Level</div>
+            <div style="background:var(--navy-700);border-radius:4px;height:8px;overflow:hidden;">
+              <div id="audioLevelBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--green-500),var(--amber-400));border-radius:4px;transition:width .05s;"></div>
+            </div>
+            <div id="vadStatus" style="font-size:11px;color:var(--slate-500);margin-top:4px;">Waiting for speech…</div>
+          </div>
+
+          <!-- Audio Player -->
+          <div id="audioPlayerWrap" class="audio-player-wrap">
+            <p style="font-size:11px;color:var(--slate-400);margin-bottom:6px;">🔊 AI Response Audio</p>
+            <audio id="audioPlayer" controls></audio>
+          </div>
+        </div>
+
+        <!-- Transcript -->
+        <div class="card">
+          <div class="card-title">
+            Live Transcript
+            <button id="btnClearTranscript" class="btn btn-ghost" style="margin-left:auto;padding:4px 10px;font-size:11px;">Clear</button>
+          </div>
+          <div id="transcriptBody" class="transcript-body">
+            <div class="transcript-empty">Start a conversation…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: SESSION INFO + DASHBOARD + LOG -->
+      <div>
+
+        <!-- Session Info -->
+        <div class="card">
+          <div class="card-title">Session Info</div>
+          <table style="width:100%;font-size:12px;border-collapse:collapse;">
+            <tr>
+              <td style="color:var(--slate-400);padding:4px 0;width:45%">Session ID</td>
+              <td id="sessionId" style="color:var(--text-primary);font-family:monospace;">—</td>
+            </tr>
+            <tr>
+              <td style="color:var(--slate-400);padding:4px 0;">Sent</td>
+              <td><span id="msgSent" style="color:var(--blue-500);font-weight:600;">0</span></td>
+            </tr>
+            <tr>
+              <td style="color:var(--slate-400);padding:4px 0;">Received</td>
+              <td><span id="msgRecv" style="color:var(--green-500);font-weight:600;">0</span></td>
+            </tr>
+          </table>
+        </div>
+
+        <!-- Dashboard -->
+        <div class="card">
+          <div class="card-title">Session Health</div>
+          <div class="dash-grid">
+            <div class="dash-tile">
+              <div class="dash-label">Avg Latency</div>
+              <div id="dashLatency" class="dash-value muted">—</div>
+            </div>
+            <div class="dash-tile">
+              <div class="dash-label">VAD / Mic</div>
+              <div id="dashVad" class="dash-value muted">—</div>
+            </div>
+            <div class="dash-tile">
+              <div class="dash-label">Messages</div>
+              <div id="dashMsgCount" class="dash-value">0</div>
+            </div>
+            <div class="dash-tile">
+              <div class="dash-label">Uptime</div>
+              <div id="dashUptime" class="dash-value muted">—</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Log Console -->
+        <div class="card">
+          <div class="card-title">Event Log</div>
+          <div id="logConsole" class="log-console">
+            <div class="log-entry">
+              <span class="log-time">[Ready]</span>
+              <span class="log-tag log-info">INFO</span>
+              <span class="log-msg"> Gabriel AI frontend loaded</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================== TAB: API TEST ======================== -->
+  <div id="tab-api" class="tab-panel">
+    <div class="api-grid">
+
+      <!-- Health -->
+      <div class="api-card">
+        <div style="margin-bottom:10px;">
+          <span class="api-method method-get">GET</span>
+          <span class="api-endpoint">/api/health</span>
+        </div>
+        <p class="api-desc">Check API health status. Used by Cloud Run for liveness probe.</p>
+        <button id="btnTestHealth" class="btn btn-success" style="width:100%;margin-bottom:10px;">▶ Run</button>
+        <div id="res-health" class="api-response">—</div>
+      </div>
+
+      <!-- Index -->
+      <div class="api-card">
+        <div style="margin-bottom:10px;">
+          <span class="api-method method-get">GET</span>
+          <span class="api-endpoint">/</span>
+        </div>
+        <p class="api-desc">Root endpoint (serves this HTML). Confirm content-type is text/html.</p>
+        <button id="btnTestIndex" class="btn btn-success" style="width:100%;margin-bottom:10px;">▶ Run</button>
+        <div id="res-index" class="api-response">—</div>
+      </div>
+
+      <!-- Text Prompt -->
+      <div class="api-card">
+        <div style="margin-bottom:10px;">
+          <span class="api-method method-post">POST</span>
+          <span class="api-endpoint">/api/test-text</span>
+        </div>
+        <p class="api-desc">Test Gemini AI response tanpa audio. Masukkan teks langsung.</p>
+        <input id="textPromptInput" type="text" value="Halo, siapa kamu?"
+          style="width:100%;padding:8px 12px;background:var(--navy-900);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:12px;margin-bottom:8px;font-family:inherit;"
+          placeholder="Ketik pertanyaan…">
+        <button id="btnTestText" class="btn btn-primary" style="width:100%;margin-bottom:10px;">▶ Send</button>
+        <div id="res-text" class="api-response">—</div>
+      </div>
+
+      <!-- Debug Meta -->
+      <div class="api-card">
+        <div style="margin-bottom:10px;">
+          <span class="api-method method-get">GET</span>
+          <span class="api-endpoint">/api/debug/latest-input-meta</span>
+        </div>
+        <p class="api-desc">Lihat metadata audio input terakhir yang diterima server.</p>
+        <button id="btnTestDebug" class="btn btn-amber" style="width:100%;margin-bottom:10px;">▶ Fetch</button>
+        <div id="res-debug" class="api-response">—</div>
+      </div>
+
+    </div>
+
+    <!-- Endpoint Reference -->
+    <div class="card" style="margin-top:20px;">
+      <div class="card-title">📋 All API Endpoints</div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse;">
+        <thead>
+          <tr style="color:var(--slate-400);border-bottom:1px solid var(--border);">
+            <th style="text-align:left;padding:8px 0;">Method</th>
+            <th style="text-align:left;padding:8px 0;">Endpoint</th>
+            <th style="text-align:left;padding:8px 0;">Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+            <td style="padding:8px 0;"><span class="api-method method-get">GET</span></td>
+            <td style="font-family:monospace;color:var(--text-muted);">/</td>
+            <td style="color:var(--slate-400);">Landing page & WebSocket test UI</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+            <td style="padding:8px 0;"><span class="api-method method-get">GET</span></td>
+            <td style="font-family:monospace;color:var(--text-muted);">/api/health</td>
+            <td style="color:var(--slate-400);">Health check</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+            <td style="padding:8px 0;"><span class="api-method method-post">POST</span></td>
+            <td style="font-family:monospace;color:var(--text-muted);">/api/process-audio</td>
+            <td style="color:var(--slate-400);">Audio (Base64 WAV) → STT → Gemini → TTS</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+            <td style="padding:8px 0;"><span class="api-method method-post">POST</span></td>
+            <td style="font-family:monospace;color:var(--text-muted);">/api/test-text</td>
+            <td style="color:var(--slate-400);">Text prompt → Gemini response (no audio)</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+            <td style="padding:8px 0;"><span class="api-method method-get">GET</span></td>
+            <td style="font-family:monospace;color:var(--text-muted);">/api/audio/&lt;id&gt;</td>
+            <td style="color:var(--slate-400);">Cached TTS audio playback</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+            <td style="padding:8px 0;"><span class="api-method method-get">GET</span></td>
+            <td style="font-family:monospace;color:var(--text-muted);">/api/debug/latest-input-meta</td>
+            <td style="color:var(--slate-400);">Last received audio metadata</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0;"><span class="api-method method-get">GET</span></td>
+            <td style="font-family:monospace;color:var(--text-muted);">/api/debug/latest-input-wav</td>
+            <td style="color:var(--slate-400);">Download last received WAV</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ======================== TAB: ESP32 GUIDE ======================== -->
+  <div id="tab-esp32" class="tab-panel">
+    <div style="max-width:760px;">
+
+      <div class="card">
+        <div class="card-title">🎯 Overview — ESP32-S3 Integration</div>
+        <p style="font-size:13px;color:var(--slate-400);line-height:1.7;">
+          Gabriel AI mendukung dua mode komunikasi dari firmware ESP32-S3:
+        </p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px;">
+          <div style="background:var(--glass);border:1px solid var(--border);border-radius:10px;padding:14px;">
+            <div style="font-weight:600;font-size:13px;color:var(--blue-500);margin-bottom:6px;">📡 REST API</div>
+            <div style="font-size:12px;color:var(--slate-400);line-height:1.6;">POST Base64-encoded WAV ke <code style="color:var(--green-500)">/api/process-audio</code>. Cocok untuk firmware awal.</div>
+          </div>
+          <div style="background:var(--glass);border:1px solid var(--border);border-radius:10px;padding:14px;">
+            <div style="font-weight:600;font-size:13px;color:var(--purple-500);margin-bottom:6px;">⚡ WebSocket</div>
+            <div style="font-size:12px;color:var(--slate-400);line-height:1.6;">Stream raw PCM16 audio chunks secara real-time. Latency lebih rendah, lebih efisien.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- REST API Guide -->
+      <div class="guide-section">
+        <div class="guide-title"><span class="step-num">1</span> REST API (POST JSON)</div>
+        <div class="code-block" id="code-rest">
+<span class="comment">// ESP32 Arduino — POST audio ke API</span>
+<span class="keyword">#include</span> <span class="string">&lt;HTTPClient.h&gt;</span>
+<span class="keyword">#include</span> <span class="string">&lt;ArduinoJson.h&gt;</span>
+<span class="keyword">#include</span> <span class="string">&lt;Base64.h&gt;</span>
+
+<span class="keyword">const char</span>* <span class="string">SERVER_URL</span> = <span class="string">"https://YOUR-SERVICE.run.app/api/process-audio"</span>;
+
+<span class="keyword">void</span> sendAudioToGabriel(<span class="keyword">uint8_t</span>* pcmBuf, <span class="keyword">size_t</span> len) {
+  <span class="comment">// Encode PCM16 as Base64</span>
+  String b64 = base64::encode(pcmBuf, len);
+
+  StaticJsonDocument&lt;<span class="number">512</span>&gt; doc;
+  doc[<span class="string">"audio"</span>] = b64;
+  doc[<span class="string">"session_id"</span>] = <span class="string">"esp32-device-001"</span>;
+  doc[<span class="string">"include_audio"</span>] = <span class="keyword">true</span>;
+  doc[<span class="string">"audio_delivery"</span>] = <span class="string">"url"</span>;
+  String payload; serializeJson(doc, payload);
+
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  http.addHeader(<span class="string">"Content-Type"</span>, <span class="string">"application/json"</span>);
+  http.addHeader(<span class="string">"X-Client"</span>, <span class="string">"esp32"</span>);   <span class="comment">// triggers minimal payload</span>
+  <span class="keyword">int</span> code = http.POST(payload);
+
+  <span class="keyword">if</span> (code == <span class="number">200</span>) {
+    String resp = http.getString();
+    <span class="comment">// Parse: {"question":"...","answer":"...","audio_url":"/api/audio/..."}</span>
+    DynamicJsonDocument res(<span class="number">1024</span>);
+    deserializeJson(res, resp);
+    Serial.println(res[<span class="string">"answer"</span>].as&lt;String&gt;());
+  }
+  http.end();
+}
+        <button class="copy-btn" data-target="code-rest">Copy</button>
+        </div>
+      </div>
+
+      <!-- WebSocket Guide -->
+      <div class="guide-section">
+        <div class="guide-title"><span class="step-num">2</span> WebSocket — Real-time Audio Stream</div>
+        <div class="code-block" id="code-ws">
+<span class="comment">// ESP32 — WebSocket binary audio streaming</span>
+<span class="keyword">#include</span> <span class="string">&lt;WebSocketsClient.h&gt;</span>
+<span class="keyword">#include</span> <span class="string">&lt;ArduinoJson.h&gt;</span>
+
+WebSocketsClient ws;
+<span class="keyword">const char</span>* WS_HOST = <span class="string">"YOUR-SERVICE.run.app"</span>;
+<span class="keyword">const int</span>   WS_PORT = <span class="number">443</span>;
+
+<span class="keyword">void</span> wsEvent(WStype_t type, <span class="keyword">uint8_t</span>* payload, <span class="keyword">size_t</span> len) {
+  <span class="keyword">if</span> (type == WStype_TEXT) {
+    <span class="comment">// Parse JSON: {"type":"result","question":"...","answer":"...","audio_url":"..."}</span>
+    DynamicJsonDocument doc(<span class="number">1024</span>);
+    deserializeJson(doc, payload, len);
+    String msgType = doc[<span class="string">"type"</span>];
+    <span class="keyword">if</span> (msgType == <span class="string">"result"</span>) {
+      String answer = doc[<span class="string">"answer"</span>];
+      <span class="comment">// Display on OLED, play TTS from audio_url, etc.</span>
+      displayOnOLED(answer);
+    }
+  }
+}
+
+<span class="keyword">void</span> setup() {
+  ws.beginSSL(WS_HOST, WS_PORT, <span class="string">"/socket.io/?transport=websocket&EIO=4"</span>);
+  ws.onEvent(wsEvent);
+}
+
+<span class="keyword">void</span> sendAudioStream(<span class="keyword">uint8_t</span>* pcmBuf, <span class="keyword">size_t</span> len) {
+  <span class="comment">// Send in 5120-byte chunks</span>
+  <span class="keyword">for</span> (<span class="keyword">size_t</span> i = <span class="number">0</span>; i &lt; len; i += <span class="number">5120</span>) {
+    <span class="keyword">size_t</span> chunk = min((<span class="keyword">size_t</span>)<span class="number">5120</span>, len - i);
+    ws.sendBIN(pcmBuf + i, chunk);
+  }
+  <span class="comment">// Signal end of audio</span>
+  ws.sendTXT(<span class="string">"{\"type\":\"audio_end\"}"</span>);
+}
+        <button class="copy-btn" data-target="code-ws">Copy</button>
+        </div>
+      </div>
+
+      <!-- Audio Format -->
+      <div class="guide-section">
+        <div class="guide-title"><span class="step-num">3</span> Audio Format Requirements</div>
+        <div class="card" style="margin:0;">
+          <table style="width:100%;font-size:12px;border-collapse:collapse;">
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px 0;color:var(--slate-400);">Format</td>
+              <td style="color:var(--text-primary);font-family:monospace;">PCM16 (raw) atau WAV</td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px 0;color:var(--slate-400);">Sample Rate</td>
+              <td style="color:var(--green-500);font-family:monospace;">16000 Hz</td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px 0;color:var(--slate-400);">Channels</td>
+              <td style="color:var(--green-500);font-family:monospace;">1 (Mono)</td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px 0;color:var(--slate-400);">Bit Depth</td>
+              <td style="color:var(--green-500);font-family:monospace;">16-bit</td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px 0;color:var(--slate-400);">Max Duration</td>
+              <td style="color:var(--amber-400);font-family:monospace;">10 detik (320KB)</td>
+            </tr>
+            <tr>
+              <td style="padding:8px 0;color:var(--slate-400);">Mic Gain</td>
+              <td style="color:var(--text-muted);font-family:monospace;">Server auto-normalize (AGC)</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+
+      <!-- WebSocket Events -->
+      <div class="guide-section">
+        <div class="guide-title"><span class="step-num">4</span> WebSocket Message Flow</div>
+        <div class="code-block" id="code-flow">
+<span class="comment">// CLIENT → SERVER messages (emit 'message' event)</span>
+{ <span class="string">"type"</span>: <span class="string">"ping"</span> }                    <span class="comment">// keepalive</span>
+{ <span class="string">"type"</span>: <span class="string">"audio_end"</span> }              <span class="comment">// signal end of audio stream</span>
+&lt;binary ArrayBuffer&gt;                <span class="comment">// raw audio chunk (max 5120 bytes)</span>
+
+<span class="comment">// SERVER → CLIENT messages (on 'message' event)</span>
+{ <span class="string">"type"</span>: <span class="string">"connected"</span>,  <span class="string">"session_id"</span>: <span class="string">"..."</span> }   <span class="comment">// on connect</span>
+{ <span class="string">"type"</span>: <span class="string">"pong"</span> }                                 <span class="comment">// ping response</span>
+{ <span class="string">"type"</span>: <span class="string">"processing"</span> }                           <span class="comment">// STT in progress</span>
+{ <span class="string">"type"</span>: <span class="string">"stt_result"</span>, <span class="string">"text"</span>: <span class="string">"..."</span> }           <span class="comment">// STT done</span>
+{ <span class="string">"type"</span>: <span class="string">"result"</span>,     <span class="string">"question"</span>: <span class="string">"..."</span>,         <span class="comment">// full response</span>
+  <span class="string">"answer"</span>: <span class="string">"..."</span>, <span class="string">"audio_url"</span>: <span class="string">"/api/audio/..."</span> }
+{ <span class="string">"type"</span>: <span class="string">"error"</span>,      <span class="string">"message"</span>: <span class="string">"..."</span> }         <span class="comment">// error</span>
+        <button class="copy-btn" data-target="code-flow">Copy</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <footer class="footer">
+    Gabriel AI Voice Assistant &nbsp;·&nbsp;
+    Powered by <a href="https://deepmind.google/technologies/gemini/" target="_blank">Gemini 2.5 Flash</a> &nbsp;·&nbsp;
+    <a href="https://github.com/hidatara-ds/gabriel" target="_blank">GitHub</a>
+  </footer>
+
+</div>
+
+<!-- App Logic -->
+<script src="/app.js"></script>
+</body>
+</html>

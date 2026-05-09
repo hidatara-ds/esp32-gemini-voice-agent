@@ -1,0 +1,16 @@
+# Firmware (Arduino/ESP32) — tidak perlu di-push ke cloud repo
+gabriel/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.db
+
+# DB / cache lokal
+session_history.db
+
+# OS
+.DS_Store
+Thumbs.db
